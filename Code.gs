@@ -1776,6 +1776,46 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
 
   var lookup = lookupTmdbWithVariants_(parsed.title, parsed.year);
 
+  // Fixed 2026-11-08: a filename with NO year at all ("Vilangu.mkv") is a
+  // much weaker signal than usual - every other movie example has at least
+  // a year to anchor on. Confirmed real case: "Vilangu" is both a 1987
+  // Tamil movie AND an unrelated 2022 Tamil web series on TMDb - with no
+  // year and no season/episode marker in the filename, there's genuinely
+  // no way to tell which one this is from the filename alone, but the old
+  // code never even looked at the TV catalog before confidently auto-
+  // filing it as the movie. This can't (and never will be able to) make
+  // the TV case auto-file correctly - that needs an actual season/episode
+  // number present in the filename, which simply isn't there - it only
+  // stops the wrong confident guess: when there's no year AND a plausible
+  // match exists on BOTH sides, that's genuinely ambiguous and goes to
+  // review instead of silently picking the movie. Only fires in the no-
+  // year case, so the ordinary (year-present) movie path is untouched.
+  var movieTvCollision = null;
+  if (lookup.matched && lookup.confident && !parsed.year) {
+    try {
+      var tvCollisionCheck = lookupTmdbTvSingle_(parsed.title, null);
+      if (tvCollisionCheck && tvCollisionCheck.matched && tvCollisionCheck.confident) {
+        movieTvCollision = tvCollisionCheck.candidates[0];
+      }
+    } catch (e) {
+      Logger.log('Movie/TV collision check failed (non-fatal, proceeding as movie): ' + e.message);
+    }
+  }
+
+  if (movieTvCollision) {
+    var collisionMsg = '⚠️ Ambiguous — could be a movie or a TV series' + folderNote + '\nFile: ' + video.name
+      + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
+      + '\nNo year in the filename, and TMDb has a plausible match on both sides:'
+      + '\n  Movie: ' + lookup.candidates[0].title + ' (' + lookup.candidates[0].year + ') — https://www.themoviedb.org/movie/' + lookup.candidates[0].tmdbId
+      + '\n  TV series: ' + movieTvCollision.title + ' (' + movieTvCollision.year + ') — https://www.themoviedb.org/tv/' + movieTvCollision.tmdbId
+      + '\nIf this is actually an episode, add a season/episode marker to the filename (e.g. "S01E05") and drop it back in — it can only be routed to TV once there is an episode number to anchor on.'
+      + fixInstruction;
+    sendToReview_(video, matchedSubs, reviewFolder, collisionMsg, dryRun,
+      '[DRY RUN] "' + video.name + '"' + folderNote + ' -> ambiguous movie/TV collision with no year in filename -> would move to RenamerReview',
+      video.topLevel);
+    return 'issue';
+  }
+
   if (lookup.matched && lookup.confident) {
     var movie = lookup.candidates[0];
     var finalBase = buildFinalBaseName_(parsed, movie);
