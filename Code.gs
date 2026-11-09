@@ -2126,7 +2126,22 @@ var EPISODE_PATTERNS_ = [
   // every filename that matched the old tight "S01E08" form still
   // matches identically since this is a strict superset of it. Extended
   // 2026-11-03 to also allow a space right after "S" ("S 01 E 01").
-  /S\s*(\d{1,2})\s*EP?\s*(\d{1,3})(?:\s*-\s*E?P?\s*(\d{1,3}))?/i,
+  //
+  // Fixed 2026-11-08: the range-closing side couldn't handle a repeated
+  // season marker - "S01E01 - S01E07" (confirmed real release: a 7-
+  // episode dump in one file). The old pattern's closing group only
+  // expected an optional bare "E"/"EP" then digits; faced with "- S01E07"
+  // it matched zero characters at that position (since the very next char
+  // was "S", not a digit), so the ENTIRE 7-episode file silently got
+  // treated as a single "S01E01" and filed under episode 1's title alone
+  // - episodes 2-7 vanished from the output with no warning. The closing
+  // group now optionally skips a repeated "S<digits>" (season number not
+  // re-validated against the opening one - trusts the release is
+  // internally consistent, same risk tolerance as the rest of this file)
+  // before the E/EP + digits. Strict superset again: every previously-
+  // working range form ("S01E01-E03", "S01E01-03") still matches exactly
+  // the same way.
+  /S\s*(\d{1,2})\s*EP?\s*(\d{1,3})(?:\s*-\s*(?:S\s*\d{1,2}\s*)?E?P?\s*(\d{1,3}))?/i,
   // Added 2026-11-03: the fully-spelled-out word form - "Season 01
   // Episode 01", with or without leading zeros on either number
   // independently ("Season 1 Episode 01", "Season 01 Episode 1", etc.).
