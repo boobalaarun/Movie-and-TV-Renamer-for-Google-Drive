@@ -1207,7 +1207,16 @@ function resolveUndoDestinationFolder_(origFolderId, origFolderDisplay) {
   }
   if (safe) return { folder: safe, recreated: false };
 
-  var fresh = getOrCreateFolder_(openFolder, subfolderName);
+  // Fixed 2026-11-09: used to recreate the stale/deleted folder fresh
+  // inside Open and file the undone item straight back in there, same as
+  // a normal "healthy folder" revert. But a folder that's gone/archived
+  // enough to need recreating is itself a sign something about this item
+  // needs a human look before it goes back into the active Open queue —
+  // so recreate it inside RenamerReview instead. Only this recreate path
+  // changes; the "healthy folder found" and "loose top-level file" cases
+  // above are untouched.
+  var reviewFolder = getReviewFolder_(openFolder);
+  var fresh = getOrCreateFolder_(reviewFolder, subfolderName);
   return { folder: fresh, recreated: true };
 }
 
@@ -1256,7 +1265,7 @@ function performUndo_(sheet, row) {
     });
 
     var recreatedNote = resolved.recreated
-      ? (' Original folder was gone/archived — recreated "' + origFolder.getName() + '" fresh inside Open and filed it there.')
+      ? (' Original folder was gone/archived — recreated "' + origFolder.getName() + '" fresh inside RenamerReview and filed it there instead of Open, so it gets a look before re-processing.')
       : '';
     sheet.getRange(row, HIST_COL_STATUS).setValue('Reverted');
     sheet.getRange(row, HIST_COL_NOTES).setValue((subErrors.length
@@ -1823,15 +1832,27 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
 
     var existing = doneFolder.getFoldersByName(folderName);
     if (existing.hasNext()) {
+      // Fixed 2026-11-09: a confirmed duplicate used to land in plain
+      // RenamerReview mixed in with every other kind of review case
+      // (ambiguous matches, unpaired subtitles, etc). For a loose
+      // top-level file — the case this is actually moved for — file it
+      // into its own "Already Exist" subfolder instead, so duplicates are
+      // easy to batch-review/clear separately from everything else. A
+      // file inside its own release folder still moves as part of that
+      // whole folder (below, via moveFolderToReview_) into plain
+      // RenamerReview, same as any other issue found in that folder —
+      // splitting a multi-item folder by individual issue type isn't done
+      // anywhere else in this script either.
+      var dupReviewFolder = video.topLevel ? getOrCreateFolder_(reviewFolder, 'Already Exist') : reviewFolder;
       var dupMsg = '⚠️ Possible duplicate' + folderNote + '\nFile: ' + video.name
         + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
         + '\nMatched: ' + movie.title + ' (' + movie.year + ')'
         + '\n"' + folderName + '" already exists in the Done folder.'
         + (video.topLevel
-          ? '\nMoving to RenamerReview instead of dropping it in alongside the existing one — check whether this is a second edition/rip you want to keep, or a true duplicate to delete.'
+          ? '\nMoving to RenamerReview/Already Exist instead of dropping it in alongside the existing one — check whether this is a second edition/rip you want to keep, or a true duplicate to delete.'
           : '\nThe whole folder will be moved to RenamerReview instead of dropping this in alongside the existing one.');
-      sendToReview_(video, matchedSubs, reviewFolder, dupMsg, dryRun,
-        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + folderName + ' but it already exists in the Done folder -> would move to RenamerReview (duplicate)',
+      sendToReview_(video, matchedSubs, dupReviewFolder, dupMsg, dryRun,
+        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + folderName + ' but it already exists in the Done folder -> would move to RenamerReview/Already Exist (duplicate)',
         video.topLevel);
       return 'issue';
     }
@@ -1888,11 +1909,16 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
       Logger.log('Rename/move failed for ' + video.name + ': ' + e.message + '\n' + e.stack);
       return 'issue';
     }
-  } else if (lookup.candidates.length >= 2) {
-    // Genuinely multiple real TMDb hits (e.g. two unrelated films that both
-    // happen to be titled "Paradise" the same year) — not a parsing problem,
-    // so fixing the filename and resubmitting wouldn't help. Offer buttons
-    // instead so you can just pick the right one, any time later.
+  } else if (lookup.candidates.length >= 1 && lookup.candidates.length <= 5) {
+    // Fixed 2026-11-09: used to require 2+ candidates before offering
+    // buttons (genuine multi-match ambiguity, e.g. two unrelated films
+    // both titled "Paradise" the same year) — a single weak/rejected
+    // candidate, the far more common review case, fell through to the
+    // text-only branch below, forcing a manual retype of the exact TMDb
+    // title to fix it. Now 1-5 candidates of ANY confidence get buttons -
+    // tap the right one (or "None of these") instead of retyping. Only
+    // falls through to text-only when there are more than 5 (too many to
+    // sensibly show as buttons) or genuinely zero (nothing to tap at all).
     sendReviewWithButtons_(video, matchedSubs, reviewFolder, parsed, lookup, dryRun, video.topLevel);
     return 'issue';
   } else {
@@ -1984,7 +2010,14 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
     // a TMDb data gap, a transient error) never blocks the rename — it's
     // enrichment, not the thing that decides where the file goes, so it
     // just comes back null and the filename falls back to the no-name form.
-    var episodeName = lookupTmdbEpisodeNameCached_(series.tmdbId, epParsed.season, epParsed.episodeStart);
+    // Fixed 2026-11-09: for a multi-episode range (e.g. S01E01-E07), a
+    // single episode's title (here, E01's) is misleading tacked onto a
+    // filename that covers the whole range — so skip the title lookup
+    // entirely for a range (also saves the TMDb call) and show only the
+    // range code.
+    var episodeName = epParsed.isMultiEpisode
+      ? null
+      : lookupTmdbEpisodeNameCached_(series.tmdbId, epParsed.season, epParsed.episodeStart);
     var finalBase = series.title + ' (' + series.year + ') ' + episodeCode_(epParsed)
       + (episodeName ? ' ' + episodeName : '')
       + (tagStr ? ' ' + tagStr : '');
@@ -2011,15 +2044,20 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
     }
 
     if (existingEpFile) {
+      // Fixed 2026-11-09: same "Already Exist" subfolder treatment as the
+      // movie duplicate check above, for a loose top-level episode file -
+      // see the comment there for why a folder-nested episode still goes
+      // to plain RenamerReview instead.
+      var dupReviewFolder = video.topLevel ? getOrCreateFolder_(reviewFolder, 'Already Exist') : reviewFolder;
       var dupMsg = '⚠️ Possible duplicate episode' + folderNote + '\nFile: ' + video.name
         + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
         + '\nMatched: ' + series.title + ' ' + episodeCode_(epParsed)
         + '\n"' + finalVideoName + '" already exists in ' + seriesFolderName + '/' + seasonFolderName
         + (video.topLevel
-          ? '\nMoving to RenamerReview instead of dropping it in alongside the existing one — check whether this is a better/duplicate rip you want to keep.'
+          ? '\nMoving to RenamerReview/Already Exist instead of dropping it in alongside the existing one — check whether this is a better/duplicate rip you want to keep.'
           : '\nThe whole folder will be moved to RenamerReview instead of dropping this in alongside the existing one.');
-      sendToReview_(video, matchedSubs, reviewFolder, dupMsg, dryRun,
-        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + seriesFolderName + '/' + seasonFolderName + '/' + finalVideoName + ' but it already exists -> would move to RenamerReview (duplicate)',
+      sendToReview_(video, matchedSubs, dupReviewFolder, dupMsg, dryRun,
+        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + seriesFolderName + '/' + seasonFolderName + '/' + finalVideoName + ' but it already exists -> would move to RenamerReview/Already Exist (duplicate)',
         video.topLevel);
       return 'issue';
     }
@@ -2430,16 +2468,26 @@ function sendReviewWithButtons_(video, matchedSubs, reviewFolder, parsed, lookup
   var folderNote = video.topLevel ? '' : ' (inside folder "' + video.parentFolder.getName() + '")';
   var candidates = lookup.candidates.slice(0, 5);
   var variantNote = '\nTried title variant(s): ' + lookup.variantsTried.map(function (v) { return '"' + v + '"'; }).join(', ');
+  // Fixed 2026-11-09: this message now also covers the "1 weak/rejected
+  // candidate" case (see the call site), not just genuine multi-match
+  // ambiguity, so the header can no longer claim "multiple real matches"
+  // unconditionally, and the same low-similarity rejection context the
+  // old text-only path showed needs to carry over here too - otherwise
+  // switching this case to buttons would silently lose it.
+  var simNote = (lookup.lowSimNotes && lookup.lowSimNotes.length)
+    ? '\nRejected low-similarity match(es):\n' + lookup.lowSimNotes.join('\n')
+    : '';
   var lines = candidates.map(function (c, i) {
     return (i + 1) + ') ' + c.title + ' (' + c.year + ') [' + c.language + ']'
       + (c.overview ? ' — ' + (c.overview.length > 140 ? c.overview.substring(0, 140) + '…' : c.overview) : '')
       + '\n   https://www.themoviedb.org/movie/' + c.tmdbId;
   }).join('\n');
-  var text = '🎬 Multiple real matches found — tap the right one' + folderNote + '\nFile: ' + video.name
+  var text = '🎬 Needs review — tap the right one below, or "None of these"' + folderNote + '\nFile: ' + video.name
     + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
     + '\nParsed title: "' + parsed.title + '"'
     + (parsed.year ? ', year ' + parsed.year : ', no year found in filename')
     + variantNote
+    + simNote
     + '\n\n' + lines
     + '\n\nTap a button below to rename & file it — works any time, even days from now.'
     + (moveFileNow
