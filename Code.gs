@@ -1454,13 +1454,26 @@ function handleCallbackQuery_(cq) {
 
   var result = finalizeReviewPick_(record, candidate);
 
+  // Fixed 2026-11-10: re-fetch rather than reuse the `pending` snapshot
+  // from above. finalizeReviewPick_ may itself have just written a BRAND
+  // NEW pending entry (the Keep OLD/Keep NEW duplicate buttons, via
+  // sendDuplicateDecisionButtons_) - saving back the stale pre-call
+  // snapshot here would silently overwrite and destroy that new token
+  // before anyone could ever tap it.
+  pending = getPendingReviews_();
   delete pending[token];
   setPendingReviews_(pending);
 
+  // A collision discovered post-pick (handled inside finalizeReviewPick_
+  // now) sends its OWN separate Keep OLD/Keep NEW message - a plain
+  // "✅ ... done" here would misreport it as finished when it's actually
+  // still awaiting a second decision.
   editMessageText_(record.chatId, record.messageId,
-    result.ok
-      ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
-      : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error));
+    result.deferredToDuplicateButtons
+      ? ('➡️ ' + record.videoName + '\n→ ' + result.summary)
+      : (result.ok
+        ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
+        : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error)));
 }
 
 // Added 2026-11-10: handles a tap on the Keep OLD / Keep NEW duplicate
@@ -1507,13 +1520,63 @@ function finalizeReviewPick_(record, candidate) {
   var parsed = { tags: record.tags };
   var finalBase = buildFinalBaseName_(parsed, movie);
   var folderName = sanitizeFilename_(movie.title + ' (' + movie.year + ')');
+  var finalVideoName = sanitizeFilename_(finalBase + '.' + record.videoExt);
 
   var existing = doneFolder.getFoldersByName(folderName);
   if (existing.hasNext()) {
-    return { ok: false, error: '"' + folderName + '" already exists in the Done folder — left as-is in RenamerReview rather than risking a silent merge. Handle this one manually.' };
-  }
+    // Fixed 2026-11-10: used to just bail here with a static error, leaving
+    // the file stuck in RenamerReview with no way to resolve it from
+    // Telegram at all. This is exactly the same situation the automatic
+    // duplicate check handles (the picked candidate's folder already
+    // exists in Done) - just discovered one step later, after a button
+    // pick, instead of up front during the normal scan. Route it into the
+    // same Keep OLD/Keep NEW buttons instead of a dead end.
+    var existingFolder = existing.next();
+    var existingFiles = [];
+    var efIter = existingFolder.getFiles();
+    while (efIter.hasNext()) {
+      var ef = efIter.next();
+      existingFiles.push({ id: ef.getId(), name: ef.getName(), size: ef.getSize() });
+    }
 
-  var finalVideoName = sanitizeFilename_(finalBase + '.' + record.videoExt);
+    var pseudoVideo = {
+      file: videoFile,
+      name: record.videoName,
+      ext: record.videoExt,
+      parentFolder: null,
+      topLevel: !record.videoParentFolderId
+    };
+    if (record.videoParentFolderId) {
+      try { pseudoVideo.parentFolder = DriveApp.getFolderById(record.videoParentFolderId); } catch (e) { /* no cleanup target, fine */ }
+    }
+    var pseudoMatchedSubs = record.subs.map(function (s) {
+      var subFile;
+      try { subFile = DriveApp.getFileById(s.fileId); } catch (e) { return null; }
+      return { file: subFile, name: s.name, ext: s.ext, langSuffix: s.langSuffix };
+    }).filter(function (s) { return s !== null; });
+
+    sendDuplicateDecisionButtons_({
+      video: pseudoVideo,
+      matchedSubs: pseudoMatchedSubs,
+      reviewFolder: getReviewFolder_(getOpenFolder_()),
+      dryRun: false,
+      folderNote: '',
+      moveFileNow: pseudoVideo.topLevel,
+      mediaKind: 'Movie',
+      matchedLabel: movie.title + ' (' + movie.year + ')',
+      existingLocationLabel: 'Done/' + folderName,
+      destFolderId: existingFolder.getId(),
+      existingFiles: existingFiles,
+      finalVideoName: finalVideoName,
+      finalBase: finalBase
+    });
+
+    return {
+      ok: true,
+      deferredToDuplicateButtons: true,
+      summary: 'matched "' + folderName + '", but that already exists in the Done folder — sent Keep OLD/Keep NEW buttons instead.'
+    };
+  }
   var subMoves = [];
   for (var i = 0; i < record.subs.length; i++) {
     var s = record.subs[i];
