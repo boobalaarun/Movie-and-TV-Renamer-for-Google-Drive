@@ -635,6 +635,79 @@ function folderIsNowEmptyOfMedia_(folder) {
   return true; // may still contain non-media junk (nfo, jpg, ...) — that still counts as "no media"
 }
 
+// Stricter than folderIsNowEmptyOfMedia_ above: that one only looks at
+// FILES directly inside a folder, which is right for a release folder
+// (Open) or a Season folder (Done/TV) - their only contents are ever
+// files. A SERIES folder is different: its contents are Season
+// SUBfolders, not files, so folderIsNowEmptyOfMedia_ would wrongly say
+// "empty" even while Season 02, Season 03, etc. still sit inside it with
+// real episodes. Used only for that one level up - see
+// sweepEmptiedDoneFolders_.
+function folderIsCompletelyEmpty_(folder) {
+  if (folder.getFiles().hasNext()) return false;
+  if (folder.getFolders().hasNext()) return false;
+  return true;
+}
+
+function collectParentFolders_(fileOrFolder) {
+  var out = [];
+  var it = fileOrFolder.getParents();
+  while (it.hasNext()) out.push(it.next());
+  return out;
+}
+
+// Added 2026-11-10: after an Undo moves a video (+ subs) OUT of the Done
+// library back to Open/RenamerReview, the folder(s) it left behind there
+// can end up empty — a "Series (Year) [tmdbid-N]/Season 01" pair with
+// nothing left in it, for example. Sweeps any now-empty one (and, one
+// level up, a Series folder left with no Season subfolders at all) into
+// RenamerReview/Empty, the same place an empty Open release folder
+// already goes. Takes the list of folders the moved file(s) used to sit
+// in (captured BEFORE the move, via collectParentFolders_) - never
+// touches the Done/TV-Done/Open/RenamerReview roots themselves even if
+// one of those happens to come through empty. Best-effort: a failure
+// here never turns a successful Undo into a reported failure, it just
+// leaves the stray empty folder for manual cleanup. Returns a short note
+// to append to the History row, or '' if nothing was swept.
+function sweepEmptiedDoneFolders_(formerParentFolders) {
+  var protectedIds = {};
+  [
+    (function () { try { return getOpenFolder_(); } catch (e) { return null; } })(),
+    (function () { try { return getReviewFolder_(getOpenFolder_()); } catch (e) { return null; } })(),
+    (function () { try { return getDoneFolder_(); } catch (e) { return null; } })(),
+    (function () { try { return getTvDoneFolder_(); } catch (e) { return null; } })()
+  ].forEach(function (f) { if (f) protectedIds[f.getId()] = true; });
+
+  var seenIds = {};
+  var sweptNames = [];
+
+  formerParentFolders.forEach(function (folder) {
+    try {
+      var id = folder.getId();
+      if (seenIds[id] || protectedIds[id]) return;
+      seenIds[id] = true;
+      if (!folderIsNowEmptyOfMedia_(folder)) return; // still has other media - leave it alone
+
+      var grandparents = collectParentFolders_(folder); // capture BEFORE moving it away
+      moveFolderToEmpty_(folder, false);
+      sweptNames.push(folder.getName());
+
+      grandparents.forEach(function (gp) {
+        try {
+          var gpId = gp.getId();
+          if (seenIds[gpId] || protectedIds[gpId]) return;
+          seenIds[gpId] = true;
+          if (!folderIsCompletelyEmpty_(gp)) return; // other seasons/content still in there
+          moveFolderToEmpty_(gp, false);
+          sweptNames.push(gp.getName());
+        } catch (e) { /* best effort only */ }
+      });
+    } catch (e) { /* best effort only */ }
+  });
+
+  return sweptNames.length ? (' Emptied folder(s) swept to RenamerReview/Empty: ' + sweptNames.join(', ') + '.') : '';
+}
+
 function moveFolderToEmpty_(folder, dryRun) {
   var name = folder.getName();
   if (dryRun) {
@@ -1248,6 +1321,7 @@ function performUndo_(sheet, row) {
 
   try {
     var videoFile = DriveApp.getFileById(videoId);
+    var formerParents = collectParentFolders_(videoFile); // capture BEFORE moving it away
     videoFile.setName(origName);
     videoFile.moveTo(origFolder);
 
@@ -1257,6 +1331,7 @@ function performUndo_(sheet, row) {
     subs.forEach(function (s) {
       try {
         var subFile = DriveApp.getFileById(s.fileId);
+        formerParents = formerParents.concat(collectParentFolders_(subFile));
         subFile.setName(s.oldName);
         subFile.moveTo(origFolder);
       } catch (e) {
@@ -1267,11 +1342,17 @@ function performUndo_(sheet, row) {
     var recreatedNote = resolved.recreated
       ? (' Original folder was gone/archived — recreated "' + origFolder.getName() + '" fresh inside RenamerReview and filed it there instead of Open, so it gets a look before re-processing.')
       : '';
+    // Fixed 2026-11-10: reverting a TV episode (or a movie) used to leave
+    // its now-empty Series/Season (or movie) folder sitting behind in the
+    // Done library untouched - nothing ever swept it away. Same cleanup an
+    // empty Open release folder already gets, just triggered from the
+    // Undo side instead.
+    var emptiedNote = sweepEmptiedDoneFolders_(formerParents);
     sheet.getRange(row, HIST_COL_STATUS).setValue('Reverted');
     sheet.getRange(row, HIST_COL_NOTES).setValue((subErrors.length
       ? ('Video reverted OK; subtitle issue(s): ' + subErrors.join('; '))
-      : ('Reverted ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm'))) + recreatedNote);
-    sendTelegram_('↩️ Undone: "' + origName + '" moved back' + (typeLabel ? ' (' + typeLabel + ')' : '') + recreatedNote, false);
+      : ('Reverted ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm'))) + recreatedNote + emptiedNote);
+    sendTelegram_('↩️ Undone: "' + origName + '" moved back' + (typeLabel ? ' (' + typeLabel + ')' : '') + recreatedNote + emptiedNote, false);
   } catch (e) {
     sheet.getRange(row, HIST_COL_STATUS).setValue('Revert Failed');
     sheet.getRange(row, HIST_COL_NOTES).setValue('Revert error: ' + e.message);
