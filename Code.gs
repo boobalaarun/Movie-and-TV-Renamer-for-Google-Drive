@@ -1328,6 +1328,17 @@ function handleCallbackQuery_(cq) {
     return;
   }
   var parts = (cq.data || '').split('|');
+
+  // Added 2026-11-10: duplicate Keep OLD/Keep NEW buttons share the same
+  // pending-token bucket as the TMDb-candidate buttons below, distinguished
+  // by the "dup" prefix instead of "rr" — handled separately since the
+  // resolution (a fixed two-way swap) is a different shape than picking
+  // one of N candidates.
+  if (parts[0] === 'dup' && parts.length === 3) {
+    handleDuplicateCallback_(cq, parts[1], parts[2]);
+    return;
+  }
+
   if (parts[0] !== 'rr' || parts.length !== 3) {
     answerCallback_(cq.id, 'Unrecognized action.');
     return;
@@ -1361,6 +1372,32 @@ function handleCallbackQuery_(cq) {
   answerCallback_(cq.id, 'Working on it…');
 
   var result = finalizeReviewPick_(record, candidate);
+
+  delete pending[token];
+  setPendingReviews_(pending);
+
+  editMessageText_(record.chatId, record.messageId,
+    result.ok
+      ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
+      : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error));
+}
+
+// Added 2026-11-10: handles a tap on the Keep OLD / Keep NEW duplicate
+// buttons (callback_data "dup|<token>|old" or "dup|<token>|new"). Mirrors
+// handleCallbackQuery_'s "rr" branch shape but dispatches to
+// resolveDuplicateDecision_ instead of finalizeReviewPick_, since there's
+// no candidate list to index into — just the two fixed choices.
+function handleDuplicateCallback_(cq, token, choice) {
+  var pending = getPendingReviews_();
+  var record = pending[token];
+  if (!record) {
+    answerCallback_(cq.id, 'This item was already resolved (or the script was redeployed since).');
+    return;
+  }
+
+  answerCallback_(cq.id, 'Working on it…');
+
+  var result = resolveDuplicateDecision_(record, choice);
 
   delete pending[token];
   setPendingReviews_(pending);
@@ -1745,6 +1782,16 @@ function moveUndersizedSubtitlesToReview_(undersizedSubs, reviewFolder, dryRun) 
   });
 }
 
+// Human-readable byte size, used in the duplicate-review message so you can
+// compare the incoming file against what's already in the Done folder
+// without having to open Drive and check.
+function formatFileSize_(bytes) {
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
 // ---------- per-video processing ----------
 
 // Returns 'success' or 'issue' (never 'error' — a TMDb failure throws and
@@ -1830,38 +1877,45 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
     var finalBase = buildFinalBaseName_(parsed, movie);
     var folderName = sanitizeFilename_(movie.title + ' (' + movie.year + ')');
 
-    var existing = doneFolder.getFoldersByName(folderName);
-    if (existing.hasNext()) {
-      // Fixed 2026-11-09: a confirmed duplicate used to land in plain
-      // RenamerReview mixed in with every other kind of review case
-      // (ambiguous matches, unpaired subtitles, etc). For a loose
-      // top-level file — the case this is actually moved for — file it
-      // into its own "Already Exist" subfolder instead, so duplicates are
-      // easy to batch-review/clear separately from everything else. A
-      // file inside its own release folder still moves as part of that
-      // whole folder (below, via moveFolderToReview_) into plain
-      // RenamerReview, same as any other issue found in that folder —
-      // splitting a multi-item folder by individual issue type isn't done
-      // anywhere else in this script either.
-      var dupReviewFolder = video.topLevel ? getOrCreateFolder_(reviewFolder, 'Already Exist') : reviewFolder;
-      var dupMsg = '⚠️ Possible duplicate' + folderNote + '\nFile: ' + video.name
-        + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
-        + '\nMatched: ' + movie.title + ' (' + movie.year + ')'
-        + '\n"' + folderName + '" already exists in the Done folder.'
-        + (video.topLevel
-          ? '\nMoving to RenamerReview/Already Exist instead of dropping it in alongside the existing one — check whether this is a second edition/rip you want to keep, or a true duplicate to delete.'
-          : '\nThe whole folder will be moved to RenamerReview instead of dropping this in alongside the existing one.');
-      sendToReview_(video, matchedSubs, dupReviewFolder, dupMsg, dryRun,
-        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + folderName + ' but it already exists in the Done folder -> would move to RenamerReview/Already Exist (duplicate)',
-        video.topLevel);
-      return 'issue';
-    }
-
     var finalVideoName = sanitizeFilename_(finalBase + '.' + video.ext);
     var subRenames = matchedSubs.map(function (s) {
       var suffix = s.langSuffix ? '.' + s.langSuffix.toLowerCase() : '';
       return { file: s.file, oldName: s.name, newName: sanitizeFilename_(finalBase + suffix + '.' + s.ext) };
     });
+
+    var existing = doneFolder.getFoldersByName(folderName);
+    if (existing.hasNext()) {
+      // Fixed 2026-11-09: used to auto-move the new file into
+      // RenamerReview/Already Exist with just a notice — no way to act on
+      // it from Telegram. Now sends tap-to-resolve buttons (Keep OLD /
+      // Keep NEW) with the existing folder's contents and sizes listed
+      // alongside the incoming file's size, so the decision can be made
+      // from the phone without opening Drive. See
+      // sendDuplicateDecisionButtons_ / resolveDuplicateDecision_.
+      var existingFolder = existing.next();
+      var existingFiles = [];
+      var efIter = existingFolder.getFiles();
+      while (efIter.hasNext()) {
+        var ef = efIter.next();
+        existingFiles.push({ id: ef.getId(), name: ef.getName(), size: ef.getSize() });
+      }
+      sendDuplicateDecisionButtons_({
+        video: video,
+        matchedSubs: matchedSubs,
+        reviewFolder: reviewFolder,
+        dryRun: dryRun,
+        folderNote: folderNote,
+        moveFileNow: video.topLevel,
+        mediaKind: 'Movie',
+        matchedLabel: movie.title + ' (' + movie.year + ')',
+        existingLocationLabel: 'Done/' + folderName,
+        destFolderId: existingFolder.getId(),
+        existingFiles: existingFiles,
+        finalVideoName: finalVideoName,
+        finalBase: finalBase
+      });
+      return 'issue';
+    }
 
     if (dryRun) {
       Logger.log('[DRY RUN] "' + video.name + '"' + folderNote + ' -> Done folder: "' + folderName + '/' + finalVideoName + '"');
@@ -2034,31 +2088,54 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
     // episodes of a show already underway); only an existing file with
     // this exact final name is a real duplicate.
     var existingEpFile = false;
+    var existingEpFiles = [];
+    var destSeasonFolderId = null;
     var tvDoneFolderForCheck = getTvDoneFolder_();
     var seriesIter = tvDoneFolderForCheck.getFoldersByName(seriesFolderName);
     if (seriesIter.hasNext()) {
       var seasonIter = seriesIter.next().getFoldersByName(seasonFolderName);
-      if (seasonIter.hasNext() && seasonIter.next().getFilesByName(finalVideoName).hasNext()) {
-        existingEpFile = true;
+      if (seasonIter.hasNext()) {
+        var seasonFolderCheck = seasonIter.next();
+        if (seasonFolderCheck.getFilesByName(finalVideoName).hasNext()) {
+          existingEpFile = true;
+          destSeasonFolderId = seasonFolderCheck.getId();
+          // Sweep up not just the exact-name video but any companion file
+          // sharing its base name (a subtitle sitting alongside it, named
+          // "<finalBase>.eng.srt" etc.) so both halves of the existing pair
+          // get listed and, on a "keep new" tap, swapped out together.
+          var sfIter = seasonFolderCheck.getFiles();
+          while (sfIter.hasNext()) {
+            var sf = sfIter.next();
+            var sfName = sf.getName();
+            if (sfName === finalVideoName
+              || (sfName.length > finalBase.length && sfName.substring(0, finalBase.length) === finalBase && sfName.charAt(finalBase.length) === '.')) {
+              existingEpFiles.push({ id: sf.getId(), name: sfName, size: sf.getSize() });
+            }
+          }
+        }
       }
     }
 
     if (existingEpFile) {
-      // Fixed 2026-11-09: same "Already Exist" subfolder treatment as the
-      // movie duplicate check above, for a loose top-level episode file -
-      // see the comment there for why a folder-nested episode still goes
-      // to plain RenamerReview instead.
-      var dupReviewFolder = video.topLevel ? getOrCreateFolder_(reviewFolder, 'Already Exist') : reviewFolder;
-      var dupMsg = '⚠️ Possible duplicate episode' + folderNote + '\nFile: ' + video.name
-        + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
-        + '\nMatched: ' + series.title + ' ' + episodeCode_(epParsed)
-        + '\n"' + finalVideoName + '" already exists in ' + seriesFolderName + '/' + seasonFolderName
-        + (video.topLevel
-          ? '\nMoving to RenamerReview/Already Exist instead of dropping it in alongside the existing one — check whether this is a better/duplicate rip you want to keep.'
-          : '\nThe whole folder will be moved to RenamerReview instead of dropping this in alongside the existing one.');
-      sendToReview_(video, matchedSubs, dupReviewFolder, dupMsg, dryRun,
-        '[DRY RUN] "' + video.name + '"' + folderNote + ' matched ' + seriesFolderName + '/' + seasonFolderName + '/' + finalVideoName + ' but it already exists -> would move to RenamerReview/Already Exist (duplicate)',
-        video.topLevel);
+      // Fixed 2026-11-09: same tap-to-resolve Keep OLD/Keep NEW buttons as
+      // the movie duplicate check above, with the existing episode (and
+      // any companion subtitle) listed with its size next to the incoming
+      // file's size.
+      sendDuplicateDecisionButtons_({
+        video: video,
+        matchedSubs: matchedSubs,
+        reviewFolder: reviewFolder,
+        dryRun: dryRun,
+        folderNote: folderNote,
+        moveFileNow: video.topLevel,
+        mediaKind: 'TV',
+        matchedLabel: series.title + ' ' + episodeCode_(epParsed),
+        existingLocationLabel: 'Done/' + seriesFolderName + '/' + seasonFolderName,
+        destFolderId: destSeasonFolderId,
+        existingFiles: existingEpFiles,
+        finalVideoName: finalVideoName,
+        finalBase: finalBase
+      });
       return 'issue';
     }
 
@@ -2553,6 +2630,194 @@ function sendReviewWithButtons_(video, matchedSubs, reviewFolder, parsed, lookup
       + '\nThe buttons above still reference this file by ID, so they may not work until it\'s back in a folder the script can find — check manually.', false);
     Logger.log('Move to review (buttoned) failed for ' + video.name + ': ' + e.message + '\n' + e.stack);
   }
+}
+
+// Added 2026-11-10: Keep OLD / Keep NEW buttons for a confirmed duplicate
+// (movie folder already exists in Done, or TV episode filename already
+// exists in its Season folder). Mirrors sendReviewWithButtons_'s shape
+// (same pending-token bucket, same moveFileNow deferral for a folder-
+// sourced file, same "works any time, even days from now" resolution via
+// doPost) but with exactly two fixed outcomes instead of N TMDb candidates:
+//   - Keep OLD: the incoming file is left out of the Done folder — it
+//     (and any matched subs) end up in RenamerReview/Already Exist.
+//   - Keep NEW: the file(s) currently in the Done destination are swapped
+//     OUT to RenamerReview/Already Exist, and the incoming file (+ subs)
+//     take their place with the normal final name.
+// opts: { video, matchedSubs, reviewFolder, dryRun, folderNote, moveFileNow,
+//         mediaKind ('Movie'|'TV'), matchedLabel, existingLocationLabel,
+//         destFolderId, existingFiles ([{id,name,size}]), finalVideoName,
+//         finalBase }
+function sendDuplicateDecisionButtons_(opts) {
+  var video = opts.video, matchedSubs = opts.matchedSubs, reviewFolder = opts.reviewFolder,
+    dryRun = opts.dryRun, folderNote = opts.folderNote, moveFileNow = opts.moveFileNow;
+
+  var existingLines = opts.existingFiles.map(function (f) {
+    return '  • ' + f.name + ' (' + formatFileSize_(f.size) + ')';
+  }).join('\n');
+
+  var text = '⚠️ Possible duplicate' + (opts.mediaKind === 'TV' ? ' episode' : '') + folderNote
+    + '\nFile: ' + video.name + ' (' + formatFileSize_(video.file.getSize()) + ')'
+    + (matchedSubs.length ? '\nSubtitle: ' + matchedSubs.map(function (s) { return s.name; }).join(', ') : '')
+    + '\nMatched: ' + opts.matchedLabel
+    + '\n\nAlready in ' + opts.existingLocationLabel + ':\n' + (existingLines || '  (nothing found — may have been moved/deleted since)')
+    + '\n\nKeep OLD = the existing copy stays, this new file goes to RenamerReview/Already Exist.'
+    + '\nKeep NEW = this file replaces it in ' + opts.existingLocationLabel + ', the old copy goes to RenamerReview/Already Exist instead.'
+    + '\nTap either one any time, even days from now.'
+    + (moveFileNow
+      ? '\n(The new file is sitting in RenamerReview right now, awaiting your choice.)'
+      : '\n(The whole folder this came from is being moved to RenamerReview along with this pending choice.)');
+
+  if (dryRun) {
+    Logger.log('[DRY RUN] "' + video.name + '"' + folderNote + ' -> duplicate vs ' + opts.existingLocationLabel + ' -> would send Keep OLD/Keep NEW buttons');
+    matchedSubs.forEach(function (s) { Logger.log('[DRY RUN]   subtitle "' + s.name + '" would move with it'); });
+    return;
+  }
+
+  var token = newReviewToken_();
+  var keyboard = [
+    [{ text: '📦 Keep OLD (existing)', callback_data: 'dup|' + token + '|old' }],
+    [{ text: '🆕 Keep NEW (incoming)', callback_data: 'dup|' + token + '|new' }]
+  ];
+
+  var sent = sendTelegramKeyboard_(text, keyboard);
+  if (!sent) {
+    Logger.log('Telegram send with duplicate-decision buttons failed for ' + video.name + ' — leaving in the Open folder for next run.');
+    return;
+  }
+
+  var pending = getPendingReviews_();
+  pending[token] = {
+    decisionKind: 'dup',
+    mediaKind: opts.mediaKind,
+    videoFileId: video.file.getId(),
+    videoName: video.name,
+    videoExt: video.ext,
+    videoParentFolderId: (!moveFileNow && video.parentFolder) ? video.parentFolder.getId() : null,
+    subs: matchedSubs.map(function (s) {
+      return { fileId: s.file.getId(), name: s.name, ext: s.ext, langSuffix: s.langSuffix };
+    }),
+    destFolderId: opts.destFolderId,
+    existingLocationLabel: opts.existingLocationLabel,
+    existingFileIds: opts.existingFiles.map(function (f) { return f.id; }),
+    finalVideoName: opts.finalVideoName,
+    finalBase: opts.finalBase,
+    chatId: sent.chatId,
+    messageId: sent.messageId,
+    createdAt: Date.now()
+  };
+  setPendingReviews_(pending);
+
+  if (!moveFileNow) return; // folder-group caller will move the whole folder instead
+
+  try {
+    video.file.moveTo(reviewFolder);
+    matchedSubs.forEach(function (s) { s.file.moveTo(reviewFolder); });
+    Logger.log('Moved to RenamerReview (awaiting duplicate-keep decision): ' + video.name);
+  } catch (e) {
+    sendTelegram_('⚠️ Move to RenamerReview FAILED\n' + video.name
+      + '\nError: ' + e.message
+      + '\nThe buttons above still reference this file by ID, so they may not work until it\'s back in a folder the script can find — check manually.', false);
+    Logger.log('Move to review (duplicate-buttoned) failed for ' + video.name + ': ' + e.message + '\n' + e.stack);
+  }
+}
+
+// Performs the actual move for a duplicate Keep OLD/Keep NEW button tap.
+// Mirrors finalizeReviewPick_'s "find everything by Drive file ID, it
+// doesn't matter which folder currently holds it" approach, since the tap
+// can come days after the file (or its whole containing folder) moved into
+// RenamerReview.
+function resolveDuplicateDecision_(record, choice) {
+  var videoFile;
+  try {
+    videoFile = DriveApp.getFileById(record.videoFileId);
+  } catch (e) {
+    return { ok: false, error: 'Could not find the new video file anymore (ID ' + record.videoFileId + ') — it may have been moved or deleted manually.' };
+  }
+
+  if (choice === 'old') {
+    try {
+      var alreadyExistFolder = getOrCreateFolder_(getReviewFolder_(getOpenFolder_()), 'Already Exist');
+      videoFile.moveTo(alreadyExistFolder);
+      record.subs.forEach(function (s) {
+        try { DriveApp.getFileById(s.fileId).moveTo(alreadyExistFolder); } catch (e) { /* sub already gone - fine */ }
+      });
+      if (record.videoParentFolderId) {
+        try {
+          var originalFolder = DriveApp.getFolderById(record.videoParentFolderId);
+          if (folderIsNowEmptyOfMedia_(originalFolder)) moveFolderToEmpty_(originalFolder, false);
+        } catch (e) { /* best effort cleanup only */ }
+      }
+      return { ok: true, summary: 'Kept the existing copy in ' + record.existingLocationLabel + '. This file moved to RenamerReview/Already Exist.' };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  if (choice === 'new') {
+    var destFolder;
+    try {
+      destFolder = DriveApp.getFolderById(record.destFolderId);
+    } catch (e) {
+      return { ok: false, error: 'Could not find ' + record.existingLocationLabel + ' anymore (it may have been moved/renamed manually). Left as-is — handle this one by hand.' };
+    }
+
+    try {
+      var alreadyExistFolder2 = getOrCreateFolder_(getReviewFolder_(getOpenFolder_()), 'Already Exist');
+      // Clear the old copy out first, so the destination is empty before
+      // the new file lands under the exact same name.
+      record.existingFileIds.forEach(function (fid) {
+        try { DriveApp.getFileById(fid).moveTo(alreadyExistFolder2); } catch (e) { /* already gone - fine */ }
+      });
+
+      videoFile.setName(record.finalVideoName);
+      videoFile.moveTo(destFolder);
+      var subMoves = [];
+      record.subs.forEach(function (s) {
+        try {
+          var subFile = DriveApp.getFileById(s.fileId);
+          var suffix = s.langSuffix ? '.' + s.langSuffix.toLowerCase() : '';
+          var newName = sanitizeFilename_(record.finalBase + suffix + '.' + s.ext);
+          subFile.setName(newName);
+          subFile.moveTo(destFolder);
+          subMoves.push({ fileId: subFile.getId(), oldName: s.name, newName: newName });
+        } catch (e) { /* sub went missing independently - don't fail the whole thing */ }
+      });
+
+      // Same "where did this come from" resolution finalizeReviewPick_
+      // uses: a folder-sourced item's parent ID if recorded, otherwise the
+      // file was sitting loose in RenamerReview right up until this move.
+      var origFolderForLog = null;
+      if (record.videoParentFolderId) {
+        try { origFolderForLog = DriveApp.getFolderById(record.videoParentFolderId); } catch (e) { origFolderForLog = null; }
+      } else {
+        try { origFolderForLog = getReviewFolder_(getOpenFolder_()); } catch (e) { origFolderForLog = null; }
+      }
+      logRenameForUndo_({
+        type: record.mediaKind,
+        videoFileId: videoFile.getId(),
+        originalName: record.videoName,
+        originalFolderId: origFolderForLog ? origFolderForLog.getId() : null,
+        originalFolderDisplay: origFolderForLog ? origFolderForLog.getName() : '',
+        newName: record.finalVideoName,
+        newFolderId: destFolder.getId(),
+        newFolderDisplay: record.existingLocationLabel,
+        subs: subMoves
+      });
+
+      if (record.videoParentFolderId) {
+        try {
+          var originalFolder2 = DriveApp.getFolderById(record.videoParentFolderId);
+          if (folderIsNowEmptyOfMedia_(originalFolder2)) moveFolderToEmpty_(originalFolder2, false);
+        } catch (e) { /* best effort cleanup only */ }
+      }
+
+      return { ok: true, summary: 'Swapped in the new file -> ' + record.existingLocationLabel + '/' + record.finalVideoName + '. Old copy moved to RenamerReview/Already Exist.' };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  return { ok: false, error: 'Unrecognized choice.' };
 }
 
 function newReviewToken_() {
