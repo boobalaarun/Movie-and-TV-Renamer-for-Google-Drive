@@ -21,6 +21,13 @@ you get Start/Stop + an optional Settings Sheet.** See "Folder structure",
 older single-`RENAMER_FOLDER_ID` setup, see **Migrating from the old single
 folder** near the bottom — nothing has to physically move.
 
+**Changed 2026-11-10 — duplicates now show file sizes and get Keep
+OLD/Keep NEW buttons (movies AND TV), and Undo cleans up empty folders it
+leaves behind.** A Done-folder collision — at scan time, or discovered
+after you tap a multi-candidate button — no longer just sits there as a
+dead-end text message; it offers a resolution. See "Folder structure",
+"Resolving a RenamerReview item", and "TV Shows" below.
+
 ## Folder structure
 
 Pick (or create) **two separate folders anywhere in Drive** — they don't
@@ -38,8 +45,9 @@ else:
 
 ```
 <your Open folder>/
-  RenamerReview/   <- ambiguous files land here, original names untouched
-    Empty/         <- folders that turned out to have no video/subtitle
+  RenamerReview/        <- ambiguous files land here, original names untouched
+    Empty/              <- folders that turned out to have no video/subtitle
+    Already Exist/      <- the file you chose NOT to keep, from a duplicate decision
   <your other files, untouched>
 
 <your Done folder>/
@@ -78,14 +86,24 @@ message explaining why, when:
 - the title can't be pinned to one confident TMDb match, even after also
   trying it with a leading "A"/"An"/"The" added or removed
 - it WAS matched confidently, but a `Title (Year)` folder for that movie
-  already exists in Done — flagged as a possible duplicate rather than
-  silently dropped in alongside it
+  already exists in Done — the Telegram message lists the existing file(s)
+  with their size next to the incoming file's size, and gives you
+  **📦 Keep OLD (existing)** / **🆕 Keep NEW (incoming)** buttons instead of
+  guessing for you. Whichever one you *don't* keep goes to
+  `RenamerReview/Already Exist`, not deleted. This needs the tap-to-resolve
+  webhook from step 8 below to be set up; see that step.
+- there's **no year in the filename**, and TMDb has a plausible, confident
+  match on *both* sides — a real movie AND a real TV series with that
+  title. Rather than silently guessing movie, it's flagged ambiguous;
+  add a season/episode marker (`S01E05`) and resubmit if it's really an
+  episode.
 
 A file that looks like a **TV episode** (`S01E02`, `1x05`, "Season 2",
 "Episode 4") is matched and filed separately — see **TV Shows** below — and
 only lands in `RenamerReview` when it genuinely needs a manual look (no
 precise episode number found, no confident series match, a Season 00
-special, or a possible duplicate episode).
+special, or a duplicate — which gets the same Keep OLD/Keep NEW buttons as
+a movie duplicate).
 
 A subtitle with no matching video in a given run, sitting loose at the top
 level of Open, is left untouched there (not moved), but you get a one-time
@@ -270,10 +288,19 @@ Fix the filename yourself (correct the year or the title spelling) and move
 it from `RenamerReview` (inside your Open folder) back into Open directly.
 It'll be picked up and re-evaluated on the next run.
 
-**Exception:** if TMDb genuinely found 2+ different real movies with the
-same title/year (not a parsing mistake — just a title collision), you'll get
-tap-to-resolve buttons in Telegram instead, covered in step 8 below.
-Fixing/resubmitting the filename won't help that case since the parse was
+**Exception:** two situations skip the drag-it-back-into-Open fix entirely
+and give you Telegram buttons instead — covered in step 8 below:
+- TMDb genuinely found 2+ different real movies with the same title/year
+  (not a parsing mistake — just a title collision) → candidate-pick buttons
+  plus a "None of these" button. **Movies only** — see **TV Shows** below
+  for why TV ambiguous-match reviews stay text-only.
+- The file (movie or TV episode) matched fine, but the Done folder already
+  has it → **Keep OLD / Keep NEW** buttons, with both files' sizes shown.
+  This one also fires *after* you tap a candidate-pick button, if the
+  candidate you chose turns out to already exist in Done — you'll get a
+  second message with Keep OLD/Keep NEW instead of an error.
+
+Fixing/resubmitting the filename won't help either case since the parse was
 already correct; the buttons are the fix.
 
 ## TV Shows (optional, added 2026-11-02)
@@ -286,9 +313,12 @@ tree — completely separate from movies:
 <your TV Done folder>/
   Series Name (Year) [tmdbid-ID]/
     Season 01/
-      Series Name S01E01 [tag1] [tag2]....ext
+      Series Name S01E01 Episode Title [tag1] [tag2]....ext
       Series Name S01E02-E03 [tag1]....ext   <- multi-episode files kept as
-                                                 one file, never split
+                                                 one file, never split, and
+                                                 the episode title is left
+                                                 off (there isn't one single
+                                                 title that fits a range)
 ```
 
 **Setup:** set `RENAMER_TV_DONE_FOLDER_ID` (see steps 4–5 above). That's
@@ -311,11 +341,19 @@ Telegram bot handle both movies and TV automatically.
 - An existing series or season folder already in your TV Done folder is
   the **normal** case (more episodes of a show you're already collecting),
   not a duplicate flag. Only a file with the exact same final episode name
-  already present gets flagged as a possible duplicate.
+  already present in that season folder is a duplicate — and that **does**
+  get the same Keep OLD/Keep NEW Telegram buttons a movie duplicate gets
+  (file sizes included), not a plain text notice. Whichever one you don't
+  keep goes to `RenamerReview/Already Exist`.
 - Ambiguous series matches (TMDb genuinely returns 2+ real shows, or no
   confident match at all) stay **text-only** in `RenamerReview` — the
-  tap-to-resolve Telegram buttons (step 8 below) are movie-only and don't
-  apply to TV.
+  candidate-*pick* buttons (step 8 below) are movie-only and don't apply to
+  TV. This is a different button type from the Keep OLD/Keep NEW duplicate
+  buttons above, which do apply to TV — "no buttons for TV" is **not**
+  true across the board, only for this one ambiguous-candidate case.
+- Same-titled series from different years (e.g. two unrelated shows both
+  called "Mahabharat") are told apart using the year in the filename, when
+  present, same idea as movie year-disambiguation.
 
 If you process TV without ever setting `RENAMER_TV_DONE_FOLDER_ID`, nothing
 breaks for your movies — the property is only read the moment a TV episode
@@ -324,15 +362,23 @@ file reports the missing property via Telegram and stays put in the Open
 folder (same as any other per-file error) until you set it and it's picked
 up on the next run.
 
-## 8. (Optional) Enable tap-to-resolve buttons for multi-match reviews
+## 8. (Optional) Enable tap-to-resolve buttons
 
-When TMDb turns up multiple real candidates for the same title and year
-(e.g. two unrelated movies both titled "Paradise" released in 2026), the
-Telegram message includes one button per candidate plus a "None of these"
-button, instead of just a text list. Tapping one — any time later, minutes
-or days — renames and files the movie immediately. Button-tap resolution is
-paused along with the scheduler by `stopAutoRenamer` — see "Start / Stop"
-above.
+Two different situations get Telegram buttons instead of a plain text
+message, and both need this same one-time setup:
+- **Multi-candidate reviews (movies only):** when TMDb turns up multiple
+  real candidates for the same title and year (e.g. two unrelated movies
+  both titled "Paradise" released in 2026), the message includes one
+  button per candidate plus a "None of these" button, instead of just a
+  text list.
+- **Duplicate decisions (movies and TV):** when the file already exists in
+  Done, the message includes **📦 Keep OLD (existing)** and **🆕 Keep NEW
+  (incoming)** buttons, with both files' sizes shown.
+
+Tapping a button — any time later, minutes or days — resolves it
+immediately: files, renames, and moves whatever that choice implies.
+Button-tap resolution is paused along with the scheduler by
+`stopAutoRenamer` — see "Start / Stop" above.
 
 This needs a one-time setup step, because Apps Script can't "listen" for a
 button tap on its own — Telegram has to be told where to send it:
@@ -423,9 +469,13 @@ pointing at a `Renamer` folder with `RenamerOpen`/`RenamerReview`/
   Start/Stop toggle, sends its Telegram message FIRST, then performs the
   actual change. If a Drive operation then fails, you get a second,
   distinct "FAILED" message.
-- **Duplicate detection is folder-name-only.** It checks whether
-  `Title (Year)` already exists in Done, not whether the actual file
-  content is the same.
+- **Duplicate detection is name-based, not content-based.** It checks
+  whether `Title (Year)` (movies) or the exact final episode filename
+  (TV) already exists in Done — not whether the actual file bytes are
+  the same. The Keep OLD/Keep NEW buttons show you each file's size so
+  you can judge for yourself (a much smaller or much larger file is a
+  strong hint it's a different release, not a true duplicate), but the
+  decision is still yours, not an automatic content check.
 - **Series detection is pattern-based, not exhaustive.** It catches the
   common `S01E02` / `1x05` / "Season N" / "Episode N" patterns, and only
   `S01E02`/`1x05` carry a precise enough episode number to auto-file — a
@@ -437,6 +487,12 @@ pointing at a `Renamer` folder with `RenamerOpen`/`RenamerReview`/
   failure; TMDb calls are paced and throw an error instead of silently
   returning "no results" on a genuine API outage — the file is left alone
   and retried automatically next run.
+- **Undoing a rename cleans up empty folders it leaves behind.** If
+  reverting a TV episode (or a movie) empties out its Season and/or
+  Series folder in the Done library, those now-empty folders are swept
+  into `RenamerReview/Empty` too, instead of sitting there empty under
+  Done forever. The Undo's History-sheet note and Telegram message say
+  which folder(s), if any, got swept.
 - **Dropping more files in while a run is in progress is always safe.**
   Each run snapshots Open once at the start; files added mid-run are
   picked up cleanly by the next one.
@@ -449,9 +505,12 @@ pointing at a `Renamer` folder with `RenamerOpen`/`RenamerReview`/
   audio, language, visual/edition) and only matching pieces survive —
   file size, release-group/site noise, and anything else not on the list
   is dropped.
-- **Multi-candidate buttons only cover genuine title collisions.** The
-  pending choice is stored in Script Properties by file ID, so it survives
-  however long you wait to tap.
+- **Every button type (candidate-pick, Keep OLD/Keep NEW) is a pending
+  choice stored in Script Properties**, not tied to a particular file ID
+  in Drive, so it survives however long you wait to tap — and survives a
+  second button flow being created in between (e.g. tapping a candidate
+  that turns out to collide in Done, which replaces that pending entry
+  with a fresh Keep OLD/Keep NEW one rather than losing it).
 - **Pairing is scoped per-folder, not global.**
 - **Folder name collisions in `RenamerReview` are not merged** — Drive
   allows two folders with identical names to coexist there; rename one if

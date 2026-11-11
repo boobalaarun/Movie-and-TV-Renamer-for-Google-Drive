@@ -18,14 +18,19 @@ beyond Google's and TMDb's free tiers.
 - **TMDb matching** with title-similarity scoring and year-based disambiguation
   for same-titled series/movies
 - **Telegram integration**: get notified as files are processed, and resolve
-  ambiguous matches by tapping a button — no need to open Apps Script
+  ambiguous matches and duplicates by tapping a button — no need to open
+  Apps Script. A duplicate shows both files' sizes and a Keep OLD/Keep NEW
+  choice, for both movies and TV
 - **Undo history**: every successful rename is logged to a "Renamer History"
-  sheet with a one-click Undo checkbox per row
+  sheet with a one-click Undo checkbox per row, which also cleans up any
+  Series/Season folder left empty by the revert
 - **Settings Sheet**: a plain Google Sheet UI for configuring folder IDs, API
   keys, dry-run mode, and pausing/resuming the scheduler — no code editing
   required for day-to-day use
 - **Safe by design**: never deletes real media files or folders; anything it
-  can't confidently handle gets moved to a review folder, original name intact
+  can't confidently handle gets moved to a review folder, original name
+  intact — a duplicate you don't keep goes to a dedicated "Already Exist"
+  folder, never deleted
 
 Two standalone companion tools live in [`tools/`](tools/):
 
