@@ -303,6 +303,54 @@ and give you Telegram buttons instead — covered in step 8 below:
 Fixing/resubmitting the filename won't help either case since the parse was
 already correct; the buttons are the fix.
 
+## Undo / Renamer History
+
+Every successful rename — movie or TV, auto-matched or resolved by a
+button tap (including a **Keep NEW** duplicate decision) — is logged as one
+row in a separate Google Sheet named **Renamer History** (tab `History`).
+No setup is needed: the Sheet is auto-created in your Drive the first time
+something succeeds. Run `setupHistorySheet` manually only if you want it
+created before any rename has happened, or to re-install its edit trigger
+if you ever removed it by hand. The Sheet's ID is stored in the
+`HISTORY_SHEET_ID` Script Property; if you delete the Sheet, a fresh one
+is created on the next rename.
+
+Visible columns: **Timestamp**, **Status**, **Type** (Movie/TV), **Undo**
+(checkbox), **Original Name**, **Original Folder**, **New Name**, **New
+Folder**, **Notes**. (File IDs and subtitle details sit in hidden columns —
+that's how Undo finds the file again.)
+
+**To undo one rename:** tick that row's **Undo** checkbox. The video (and
+any subtitle logged with it) is moved back to its original name and
+original folder, found by Drive file ID — so it works even if the file was
+moved or renamed since. Status becomes `Reverted`, you get a Telegram
+message, and the Notes cell records what happened.
+
+- **Per-item only.** There is no "undo my whole last run" — tick each row
+  you want reverted.
+- Only a row whose Status is still `Done` reacts. Unticking does nothing;
+  re-ticking an already `Reverted` / `Revert Failed` row is ignored.
+- **If the original folder is gone or stale** (trashed, or no longer a
+  direct child of Open — e.g. it was swept into `RenamerReview/Empty` after
+  the rename emptied it), Undo does **not** put the file back into Open or
+  into Trash. It recreates a same-named folder inside **`RenamerReview`**
+  and files it there, so it gets a look before re-processing. The Notes
+  cell and Telegram message say so.
+- **Empty-folder cleanup.** If reverting leaves a Season and/or Series
+  folder (or a movie folder) empty in your Done library, those folders are
+  moved to `RenamerReview/Empty` — never deleted. A Series folder is only
+  swept if it has no other seasons left.
+- A row with no recorded original location can't be auto-undone — it's
+  marked `Revert Failed` and you're told to move it back by hand.
+- **Undo reverses renames only.** It does not reverse a **Keep OLD**
+  duplicate decision (nothing was renamed — the incoming file was just
+  parked in `RenamerReview/Already Exist`); drag it back yourself if you
+  change your mind.
+- The log keeps the most recent 1000 rows; older rows are trimmed
+  automatically. Only log rows are ever deleted this way, never media.
+- Logging is best-effort: if the Sheets API hiccups twice in a row, that
+  one rename still succeeds but has no Undo row.
+
 ## TV Shows (optional, added 2026-11-02)
 
 A file that looks like a TV episode (`S01E02`, `1x05`, "Season N", "Episode
