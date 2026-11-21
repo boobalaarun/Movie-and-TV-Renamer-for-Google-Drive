@@ -405,11 +405,15 @@ free account, this feature will not hold all of it.
 
 **One-time setup**
 1. Create an API app at trakt.tv/oauth/applications → **New Application**.
-   Name: anything. Redirect URI: `urn:ietf:wg:oauth:2.0:oob`. Save, then copy
-   the **Client ID** and **Client Secret**.
-2. Add two Script Properties (or fill the matching rows in the Settings
-   Sheet — re-run `setupSettingsSheet` first so the new rows appear):
-   `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`.
+   Save it, then copy the **Client ID**. Older apps also show a **Client
+   Secret**; newer "PKCE" apps are issued **none** (the page says "Not
+   issued") — that's fine, leave the secret out. If the page lets you set a
+   Redirect URI, `urn:ietf:wg:oauth:2.0:oob` is what the script sends on a
+   token refresh; if you registered a different one, add it as the optional
+   Script Property `TRAKT_REDIRECT_URI`.
+2. Add Script Properties (or fill the matching rows in the Settings Sheet —
+   re-run `setupSettingsSheet` first so the new rows appear):
+   `TRAKT_CLIENT_ID`, and `TRAKT_CLIENT_SECRET` **only if Trakt issued one**.
 3. Run **`traktAuthStart`**. It sends a Telegram message with a short code
    and `https://trakt.tv/activate`. Open that page, enter the code, approve.
 4. Run **`traktAuthFinish`**. It waits up to ~90 seconds for your approval
@@ -424,6 +428,14 @@ free account, this feature will not hold all of it.
 
 The login refreshes itself. If Trakt ever revokes it, the Telegram message
 will say so — re-run `traktAuthStart` / `traktAuthFinish`.
+
+**Secret-less apps — not yet proven.** The script uses Trakt's device-code
+login (the code you type on trakt.tv/activate). Trakt's public documentation
+describes the newer PKCE login for apps without a secret and doesn't say
+whether the device-code login is accepted for them. The script omits the
+secret when none is set, but if `traktAuthStart` or `traktAuthFinish` fails
+with an error from Trakt, that error text is what decides the next step
+(the fallback is a PKCE login through the Web App URL).
 
 **Backfilling what's already in Done** — run **`backfillTraktLists`**:
 - Movie folders are read for the `[tmdbid-…]` in their video filenames;

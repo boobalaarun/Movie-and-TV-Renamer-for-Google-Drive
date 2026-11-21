@@ -199,8 +199,8 @@ var SETTINGS_FIELDS_ = [
   { key: 'TMDB_API_KEY', section: 'API', type: 'text', note: 'TMDb v3 API key.' },
   { key: 'TELEGRAM_BOT_TOKEN', section: 'API', type: 'text', note: 'Telegram bot token from @BotFather.' },
   { key: 'TELEGRAM_CHAT_ID', section: 'API', type: 'text', note: 'Your Telegram chat ID.' },
-  { key: 'TRAKT_CLIENT_ID', section: 'API', type: 'text', note: 'Optional. Trakt app Client ID (trakt.tv/oauth/applications). Leave blank to keep the Trakt list feature off. After filling both Trakt fields, run traktAuthStart then traktAuthFinish once.' },
-  { key: 'TRAKT_CLIENT_SECRET', section: 'API', type: 'text', note: 'Optional. Trakt app Client Secret — see TRAKT_CLIENT_ID above.' },
+  { key: 'TRAKT_CLIENT_ID', section: 'API', type: 'text', note: 'Optional. Trakt app Client ID (trakt.tv/oauth/applications). Leave blank to keep the Trakt list feature off. After filling it in, run traktAuthStart then traktAuthFinish once.' },
+  { key: 'TRAKT_CLIENT_SECRET', section: 'API', type: 'text', note: 'Optional. Trakt app Client Secret — leave BLANK if Trakt did not issue one (newer apps have none) — see TRAKT_CLIENT_ID above.' },
   { key: 'DRY_RUN', section: 'BEHAVIOR', type: 'checkbox', note: 'Checked = log only, nothing moves, no Telegram messages. Unchecked = live.' },
   { key: 'SCHEDULER_PAUSED', section: 'BEHAVIOR', type: 'checkbox', note: 'Checked = automatic 15-min runs AND Telegram button-tap resolution are both paused (processRenamerFolder still works manually). Unchecked = running normally. Checking this box runs the same checks as stopAutoRenamer() — refused, and the box unchecks itself again, if a run is currently in progress.' }
 ];
@@ -1417,14 +1417,27 @@ var g_traktFailStreak_ = 0;
 var g_traktDisabledReason_ = null; // set after repeated failures so a Trakt outage can't eat the run's time budget
 
 function traktConfigured_() {
-  return !!(getProp_('TRAKT_CLIENT_ID') && getProp_('TRAKT_CLIENT_SECRET') && getProp_('TRAKT_REFRESH_TOKEN'));
+  // Client secret is optional: Trakt's newer PKCE-style apps are issued none.
+  return !!(getProp_('TRAKT_CLIENT_ID') && getProp_('TRAKT_REFRESH_TOKEN'));
 }
 
 // ----- one-time login (device-code flow: no redirect URL, nothing to paste) -----
 
+// Added 2026-11-21: Trakt's newer apps ("PKCE" apps) are issued NO client
+// secret. Only send client_secret / redirect_uri when they are set, so an app
+// with a secret behaves exactly as before and one without simply omits it.
+// Whether Trakt accepts the device-code login for a secret-less app is not
+// something its public docs state — if traktAuthStart/Finish is rejected,
+// the exact error text is what to look at next.
+function traktSecretFields_() {
+  var out = {};
+  var secret = getProp_('TRAKT_CLIENT_SECRET');
+  if (secret) out.client_secret = secret;
+  return out;
+}
+
 function traktAuthStart() {
   var clientId = requireProp_('TRAKT_CLIENT_ID');
-  requireProp_('TRAKT_CLIENT_SECRET');
   var res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/device/code', {
     method: 'post', contentType: 'application/json',
     payload: JSON.stringify({ client_id: clientId }), muteHttpExceptions: true
@@ -1446,7 +1459,6 @@ function traktAuthStart() {
 
 function traktAuthFinish() {
   var clientId = requireProp_('TRAKT_CLIENT_ID');
-  var clientSecret = requireProp_('TRAKT_CLIENT_SECRET');
   var code = getProp_('TRAKT_DEVICE_CODE');
   if (!code) throw new Error('No login in progress — run traktAuthStart first.');
   var expiresAt = Number(getProp_('TRAKT_DEVICE_EXPIRES_AT') || 0);
@@ -1454,9 +1466,12 @@ function traktAuthFinish() {
   var deadline = Math.min(expiresAt || Infinity, Date.now() + 90 * 1000);
 
   while (true) {
+    var tokenBody = traktSecretFields_();
+    tokenBody.code = code;
+    tokenBody.client_id = clientId;
     var res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/device/token', {
       method: 'post', contentType: 'application/json',
-      payload: JSON.stringify({ code: code, client_id: clientId, client_secret: clientSecret }),
+      payload: JSON.stringify(tokenBody),
       muteHttpExceptions: true
     });
     var c = res.getResponseCode();
@@ -1473,7 +1488,7 @@ function traktAuthFinish() {
     }
     if (c === 429) interval += 1;                       // asked to slow down
     else if (c !== 400) {                               // 400 = not approved yet; everything else is final
-      var why = { 404: 'invalid device code', 409: 'that code was already used', 410: 'the code expired', 418: 'you denied the request' }[c] || ('HTTP ' + c);
+      var why = { 404: 'invalid device code', 409: 'that code was already used', 410: 'the code expired', 418: 'you denied the request' }[c] || ('HTTP ' + c + ': ' + res.getContentText().substring(0, 200));
       throw new Error('Trakt login failed: ' + why + '. Run traktAuthStart again.');
     }
     if (Date.now() + interval * 1000 > deadline) break;
@@ -1495,21 +1510,23 @@ function traktStoreTokens_(t) {
 function traktRefresh_() {
   var res;
   try {
+    var refreshBody = traktSecretFields_();
+    refreshBody.refresh_token = getProp_('TRAKT_REFRESH_TOKEN');
+    refreshBody.client_id = getProp_('TRAKT_CLIENT_ID');
+    refreshBody.redirect_uri = getProp_('TRAKT_REDIRECT_URI') || 'urn:ietf:wg:oauth:2.0:oob';
+    refreshBody.grant_type = 'refresh_token';
     res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/token', {
       method: 'post', contentType: 'application/json',
-      payload: JSON.stringify({
-        refresh_token: getProp_('TRAKT_REFRESH_TOKEN'),
-        client_id: getProp_('TRAKT_CLIENT_ID'),
-        client_secret: getProp_('TRAKT_CLIENT_SECRET'),
-        redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
-        grant_type: 'refresh_token'
-      }),
+      payload: JSON.stringify(refreshBody),
       muteHttpExceptions: true
     });
   } catch (e) {
     throw new Error('Trakt unreachable while refreshing login: ' + e.message);
   }
-  if (res.getResponseCode() !== 200) throw new Error(TRAKT_REAUTH_MSG_);
+  if (res.getResponseCode() !== 200) {
+    Logger.log('Trakt refresh rejected (HTTP ' + res.getResponseCode() + '): ' + res.getContentText().substring(0, 200));
+    throw new Error(TRAKT_REAUTH_MSG_);
+  }
   traktStoreTokens_(JSON.parse(res.getContentText()));
 }
 
@@ -1733,7 +1750,7 @@ function traktUndoNote_(rawJson) {
 
 // Creates both lists if missing and reports where things stand.
 function traktTestConnection() {
-  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET, then run traktAuthStart and traktAuthFinish.');
+  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID (and TRAKT_CLIENT_SECRET if Trakt gave you one), then run traktAuthStart and traktAuthFinish.');
   var lines = [];
   ['movie', 'show'].forEach(function (kind) {
     try {
@@ -1776,7 +1793,7 @@ function tmdbIdFromMovieFolder_(folder) {
 // slices and remembers where it stopped (TRAKT_BACKFILL_STATE) — just run it
 // again until it reports "finished". With DRY_RUN=true it only counts.
 function backfillTraktLists() {
-  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET, then run traktAuthStart and traktAuthFinish.');
+  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID (and TRAKT_CLIENT_SECRET if Trakt gave you one), then run traktAuthStart and traktAuthFinish.');
   var dry = getProp_('DRY_RUN') === 'true';
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) { Logger.log('Another run is in progress — try again in a few minutes.'); return 'busy'; }
