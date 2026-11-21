@@ -21,6 +21,11 @@ beyond Google's and TMDb's free tiers.
   ambiguous matches and duplicates by tapping a button — no need to open
   Apps Script. A duplicate shows both files' sizes and a Keep OLD/Keep NEW
   choice, for both movies and TV
+- **Trakt lists** (optional): every movie filed goes into a private Trakt
+  list `GDriveMovies` and every TV show into `GDriveSeries`, reported in the
+  same Telegram message — with a Retry button if Trakt is down. Undo removes
+  it again, and a one-time backfill covers what's already in your library.
+  Note Trakt caps list sizes on free accounts — see SETUP.md
 - **Undo history**: every successful rename is logged to a "Renamer History"
   sheet with a one-click Undo checkbox per row, which also cleans up any
   Series/Season folder left empty by the revert

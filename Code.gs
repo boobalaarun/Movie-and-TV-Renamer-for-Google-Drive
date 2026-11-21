@@ -199,6 +199,8 @@ var SETTINGS_FIELDS_ = [
   { key: 'TMDB_API_KEY', section: 'API', type: 'text', note: 'TMDb v3 API key.' },
   { key: 'TELEGRAM_BOT_TOKEN', section: 'API', type: 'text', note: 'Telegram bot token from @BotFather.' },
   { key: 'TELEGRAM_CHAT_ID', section: 'API', type: 'text', note: 'Your Telegram chat ID.' },
+  { key: 'TRAKT_CLIENT_ID', section: 'API', type: 'text', note: 'Optional. Trakt app Client ID (trakt.tv/oauth/applications). Leave blank to keep the Trakt list feature off. After filling both Trakt fields, run traktAuthStart then traktAuthFinish once.' },
+  { key: 'TRAKT_CLIENT_SECRET', section: 'API', type: 'text', note: 'Optional. Trakt app Client Secret — see TRAKT_CLIENT_ID above.' },
   { key: 'DRY_RUN', section: 'BEHAVIOR', type: 'checkbox', note: 'Checked = log only, nothing moves, no Telegram messages. Unchecked = live.' },
   { key: 'SCHEDULER_PAUSED', section: 'BEHAVIOR', type: 'checkbox', note: 'Checked = automatic 15-min runs AND Telegram button-tap resolution are both paused (processRenamerFolder still works manually). Unchecked = running normally. Checking this box runs the same checks as stopAutoRenamer() — refused, and the box unchecks itself again, if a run is currently in progress.' }
 ];
@@ -1117,8 +1119,9 @@ function setupPropertiesTemplate() {
 
 var HIST_COL_TIMESTAMP = 1, HIST_COL_STATUS = 2, HIST_COL_TYPE = 3, HIST_COL_UNDO = 4,
   HIST_COL_VIDEO_ID = 5, HIST_COL_ORIG_NAME = 6, HIST_COL_ORIG_FOLDER_ID = 7, HIST_COL_ORIG_FOLDER = 8,
-  HIST_COL_NEW_NAME = 9, HIST_COL_NEW_FOLDER_ID = 10, HIST_COL_NEW_FOLDER = 11, HIST_COL_SUBS_JSON = 12, HIST_COL_NOTES = 13;
-var HIST_TOTAL_COLS = 13;
+  HIST_COL_NEW_NAME = 9, HIST_COL_NEW_FOLDER_ID = 10, HIST_COL_NEW_FOLDER = 11, HIST_COL_SUBS_JSON = 12, HIST_COL_NOTES = 13,
+  HIST_COL_TRAKT = 14; // added 2026-11-21: {kind,tmdbId,title,year,folderName} so Undo can take the title off its Trakt list
+var HIST_TOTAL_COLS = 14;
 var HIST_MAX_ROWS = 1000;
 
 function setupHistorySheet() {
@@ -1141,15 +1144,30 @@ function getOrCreateHistorySheet_() {
     var sheet = ss.getSheets()[0];
     sheet.setName('History');
     var header = ['Timestamp', 'Status', 'Type', 'Undo', 'Video File ID', 'Original Name',
-      'Original Folder ID', 'Original Folder', 'New Name', 'New Folder ID', 'New Folder', 'Subs JSON', 'Notes'];
+      'Original Folder ID', 'Original Folder', 'New Name', 'New Folder ID', 'New Folder', 'Subs JSON', 'Notes', 'Trakt JSON'];
     sheet.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
     sheet.setFrozenRows(1);
     sheet.hideColumns(HIST_COL_VIDEO_ID);
     sheet.hideColumns(HIST_COL_ORIG_FOLDER_ID);
     sheet.hideColumns(HIST_COL_NEW_FOLDER_ID);
     sheet.hideColumns(HIST_COL_SUBS_JSON);
+    sheet.hideColumns(HIST_COL_TRAKT);
+    props.setProperty('HISTORY_TRAKT_COL', '1');
     installHistorySheetTrigger_(ss);
     Logger.log('Renamer History sheet created: ' + ss.getUrl());
+  } else if (props.getProperty('HISTORY_TRAKT_COL') !== '1') {
+    // A History sheet created before 2026-11-21 has no 14th column yet.
+    // One-time upgrade (flagged in a Script Property so it costs nothing
+    // afterwards): add the header and hide the column. Best effort — a
+    // failure just means Undo can't remove from Trakt for new rows.
+    try {
+      var upSheet = ss.getSheets()[0];
+      upSheet.getRange(1, HIST_COL_TRAKT).setValue('Trakt JSON').setFontWeight('bold');
+      upSheet.hideColumns(HIST_COL_TRAKT);
+      props.setProperty('HISTORY_TRAKT_COL', '1');
+    } catch (e) {
+      Logger.log('Could not add the Trakt JSON column to the History sheet: ' + e.message);
+    }
   }
   return ss;
 }
@@ -1196,7 +1214,8 @@ function logRenameForUndo_(opts) {
         opts.newFolderId,
         opts.newFolderDisplay,
         JSON.stringify(opts.subs || []),
-        opts.originalFolderId ? '' : 'Original location was not recorded for this entry — cannot auto-undo.'
+        opts.originalFolderId ? '' : 'Original location was not recorded for this entry — cannot auto-undo.',
+        opts.trakt ? JSON.stringify(opts.trakt) : ''
       ];
       var lastRow = sheet.getLastRow();
       sheet.getRange(lastRow + 1, 1, 1, HIST_TOTAL_COLS).setValues([row]);
@@ -1300,6 +1319,7 @@ function performUndo_(sheet, row) {
   var origFolderDisplay = sheet.getRange(row, HIST_COL_ORIG_FOLDER).getValue();
   var subsJson = sheet.getRange(row, HIST_COL_SUBS_JSON).getValue();
   var typeLabel = sheet.getRange(row, HIST_COL_TYPE).getValue();
+  var traktJson = sheet.getRange(row, HIST_COL_TRAKT).getValue();
 
   if (!origFolderId) {
     sheet.getRange(row, HIST_COL_STATUS).setValue('Revert Failed');
@@ -1348,6 +1368,11 @@ function performUndo_(sheet, row) {
     // empty Open release folder already gets, just triggered from the
     // Undo side instead.
     var emptiedNote = sweepEmptiedDoneFolders_(formerParents);
+    // Added 2026-11-21: take the title off its Trakt list too, once nothing
+    // of it is left in Done. Best effort — never fails the revert itself.
+    var traktNote = '';
+    try { traktNote = traktUndoNote_(traktJson); } catch (traktErr) { traktNote = ' ⚠️ Trakt: removal skipped (' + traktErr.message + ').'; }
+    emptiedNote += traktNote;
     sheet.getRange(row, HIST_COL_STATUS).setValue('Reverted');
     sheet.getRange(row, HIST_COL_NOTES).setValue((subErrors.length
       ? ('Video reverted OK; subtitle issue(s): ' + subErrors.join('; '))
@@ -1357,6 +1382,485 @@ function performUndo_(sheet, row) {
     sheet.getRange(row, HIST_COL_STATUS).setValue('Revert Failed');
     sheet.getRange(row, HIST_COL_NOTES).setValue('Revert error: ' + e.message);
     sendTelegram_('⚠️ Undo failed for "' + origName + '": ' + e.message, false);
+  }
+}
+
+// ---------- Trakt lists (added 2026-11-21) ----------
+//
+// Optional. Every movie that lands in the Done folder is added to a private
+// Trakt custom list named GDriveMovies, and every TV show that gets an
+// episode filed is added (once, at SHOW level) to GDriveSeries. The result
+// is appended to the same Telegram message that announced the move. If Trakt
+// can't be reached, the file is STILL moved — the message says so and offers
+// a "Retry Trakt" button instead. Undo removes the title again, but only once
+// nothing of it is left in the Done library. Dry run never calls Trakt.
+//
+// The feature is OFF until TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET and the
+// one-time login (traktAuthStart -> traktAuthFinish) are all done — with any
+// of them missing, nothing here runs and no message changes at all.
+//
+// "Retry Trakt" is stateless on purpose: the button's callback_data carries
+// the kind and TMDb id ("trk|m|123" / "trk|s|456"), so failures never add to
+// the PENDING_REVIEWS Script Property (a single ~9KB blob a long outage
+// could otherwise overflow). The tap handler rebuilds the message from the
+// text Telegram hands back with the tap.
+
+var TRAKT_API_ = 'https://api.trakt.tv';
+var TRAKT_LIST_NAME_ = { movie: 'GDriveMovies', show: 'GDriveSeries' };
+var TRAKT_LIST_SLUG_PROP_ = { movie: 'TRAKT_LIST_SLUG_MOVIES', show: 'TRAKT_LIST_SLUG_SERIES' };
+var TRAKT_WRITE_PACING_MS_ = 1100; // Trakt allows ~1 write/second
+var TRAKT_REAUTH_MSG_ = 'Trakt login expired or was revoked — run traktAuthStart, approve the code on trakt.tv, then run traktAuthFinish.';
+
+// Per-execution state (Apps Script re-initializes globals every run).
+var g_traktShowResult_ = {};      // tmdbId -> result already obtained this run, so a 20-episode season costs one call
+var g_traktFailStreak_ = 0;
+var g_traktDisabledReason_ = null; // set after repeated failures so a Trakt outage can't eat the run's time budget
+
+function traktConfigured_() {
+  return !!(getProp_('TRAKT_CLIENT_ID') && getProp_('TRAKT_CLIENT_SECRET') && getProp_('TRAKT_REFRESH_TOKEN'));
+}
+
+// ----- one-time login (device-code flow: no redirect URL, nothing to paste) -----
+
+function traktAuthStart() {
+  var clientId = requireProp_('TRAKT_CLIENT_ID');
+  requireProp_('TRAKT_CLIENT_SECRET');
+  var res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/device/code', {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({ client_id: clientId }), muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) {
+    throw new Error('Trakt device-code request failed (HTTP ' + res.getResponseCode() + '): ' + res.getContentText().substring(0, 200) + ' — check TRAKT_CLIENT_ID.');
+  }
+  var d = JSON.parse(res.getContentText());
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('TRAKT_DEVICE_CODE', d.device_code);
+  props.setProperty('TRAKT_DEVICE_EXPIRES_AT', String(Date.now() + d.expires_in * 1000));
+  props.setProperty('TRAKT_DEVICE_INTERVAL', String(d.interval || 5));
+  var msg = '🔑 Trakt login: open ' + d.verification_url + ' and enter code ' + d.user_code
+    + '\nThen run traktAuthFinish in the Apps Script editor. The code is valid for about ' + Math.round(d.expires_in / 60) + ' minutes.';
+  Logger.log(msg);
+  sendTelegram_(msg, false);
+  return msg;
+}
+
+function traktAuthFinish() {
+  var clientId = requireProp_('TRAKT_CLIENT_ID');
+  var clientSecret = requireProp_('TRAKT_CLIENT_SECRET');
+  var code = getProp_('TRAKT_DEVICE_CODE');
+  if (!code) throw new Error('No login in progress — run traktAuthStart first.');
+  var expiresAt = Number(getProp_('TRAKT_DEVICE_EXPIRES_AT') || 0);
+  var interval = Math.max(Number(getProp_('TRAKT_DEVICE_INTERVAL') || 5), 1);
+  var deadline = Math.min(expiresAt || Infinity, Date.now() + 90 * 1000);
+
+  while (true) {
+    var res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/device/token', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ code: code, client_id: clientId, client_secret: clientSecret }),
+      muteHttpExceptions: true
+    });
+    var c = res.getResponseCode();
+    if (c === 200) {
+      traktStoreTokens_(JSON.parse(res.getContentText()));
+      var props = PropertiesService.getScriptProperties();
+      props.deleteProperty('TRAKT_DEVICE_CODE');
+      props.deleteProperty('TRAKT_DEVICE_EXPIRES_AT');
+      props.deleteProperty('TRAKT_DEVICE_INTERVAL');
+      var ok = '✅ Trakt connected. New renames will be added to the GDriveMovies / GDriveSeries lists. Run traktTestConnection to create the lists now, and backfillTraktLists to add what is already in Done.';
+      Logger.log(ok);
+      sendTelegram_(ok, false);
+      return 'connected';
+    }
+    if (c === 429) interval += 1;                       // asked to slow down
+    else if (c !== 400) {                               // 400 = not approved yet; everything else is final
+      var why = { 404: 'invalid device code', 409: 'that code was already used', 410: 'the code expired', 418: 'you denied the request' }[c] || ('HTTP ' + c);
+      throw new Error('Trakt login failed: ' + why + '. Run traktAuthStart again.');
+    }
+    if (Date.now() + interval * 1000 > deadline) break;
+    Utilities.sleep(interval * 1000);
+  }
+  var pending = 'Not approved yet — approve the code on trakt.tv, then run traktAuthFinish again (the code stays valid until it expires).';
+  Logger.log(pending);
+  return pending;
+}
+
+function traktStoreTokens_(t) {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('TRAKT_ACCESS_TOKEN', t.access_token);
+  props.setProperty('TRAKT_REFRESH_TOKEN', t.refresh_token);
+  var created = t.created_at || Math.floor(Date.now() / 1000);
+  props.setProperty('TRAKT_TOKEN_EXPIRES_AT', String((created + (t.expires_in || 0)) * 1000));
+}
+
+function traktRefresh_() {
+  var res;
+  try {
+    res = UrlFetchApp.fetch(TRAKT_API_ + '/oauth/token', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({
+        refresh_token: getProp_('TRAKT_REFRESH_TOKEN'),
+        client_id: getProp_('TRAKT_CLIENT_ID'),
+        client_secret: getProp_('TRAKT_CLIENT_SECRET'),
+        redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
+        grant_type: 'refresh_token'
+      }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    throw new Error('Trakt unreachable while refreshing login: ' + e.message);
+  }
+  if (res.getResponseCode() !== 200) throw new Error(TRAKT_REAUTH_MSG_);
+  traktStoreTokens_(JSON.parse(res.getContentText()));
+}
+
+function traktAccessToken_() {
+  var exp = Number(getProp_('TRAKT_TOKEN_EXPIRES_AT') || 0);
+  if (!getProp_('TRAKT_ACCESS_TOKEN') || (exp && Date.now() > exp - 5 * 60 * 1000)) traktRefresh_();
+  return getProp_('TRAKT_ACCESS_TOKEN');
+}
+
+// ----- low-level request -----
+// Never throws. Returns { ok, code, body, error }. code 0 = network failure.
+function traktRequest_(method, path, payload) {
+  var refreshed = false;
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var token;
+    try { token = traktAccessToken_(); } catch (e) { return { ok: false, code: 401, error: e.message }; }
+    var res;
+    try {
+      var opts = {
+        method: method.toLowerCase(), contentType: 'application/json', muteHttpExceptions: true,
+        headers: { 'trakt-api-version': '2', 'trakt-api-key': getProp_('TRAKT_CLIENT_ID'), 'Authorization': 'Bearer ' + token }
+      };
+      if (payload) opts.payload = JSON.stringify(payload);
+      res = UrlFetchApp.fetch(TRAKT_API_ + path, opts);
+    } catch (e) {
+      return { ok: false, code: 0, error: 'could not reach Trakt (' + e.message + ')' };
+    }
+    var code = res.getResponseCode();
+    if (method !== 'GET') Utilities.sleep(TRAKT_WRITE_PACING_MS_);
+    if (code === 401 && !refreshed) {
+      refreshed = true;
+      try { traktRefresh_(); } catch (e) { return { ok: false, code: 401, error: e.message }; }
+      continue;
+    }
+    if (code === 429) {
+      var hdrs = res.getHeaders ? res.getHeaders() : {};
+      var wait = parseInt(hdrs['Retry-After'] || hdrs['retry-after'] || '3', 10);
+      Utilities.sleep(Math.min(isNaN(wait) ? 3 : wait, 20) * 1000);
+      continue;
+    }
+    var text = res.getContentText();
+    var body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
+    if (code >= 200 && code < 300) return { ok: true, code: code, body: body };
+    return { ok: false, code: code, body: body, error: traktErrorText_(code, text) };
+  }
+  return { ok: false, code: 429, error: 'Trakt rate limit — try again in a minute' };
+}
+
+function traktErrorText_(code, rawText) {
+  if (code === 420) return 'Trakt account limit reached (free accounts cap list size — see SETUP.md "Trakt lists")';
+  if (code === 401) return TRAKT_REAUTH_MSG_;
+  if (code === 423) return 'Trakt account is locked — contact Trakt support';
+  if (code === 426) return 'Trakt says this needs VIP';
+  if (code === 404) return 'Trakt list or item not found';
+  if (code >= 500) return 'Trakt is having problems (HTTP ' + code + ')';
+  return 'Trakt HTTP ' + code + ': ' + String(rawText || '').substring(0, 120);
+}
+
+// ----- lists -----
+
+// Finds (or creates) the private custom list for this kind, caching its slug
+// in a Script Property. Looks up by NAME before creating, so losing the
+// cached slug can never produce a duplicate list.
+function traktListSlug_(kind) {
+  var propName = TRAKT_LIST_SLUG_PROP_[kind];
+  var slug = getProp_(propName);
+  if (slug) return slug;
+  var name = TRAKT_LIST_NAME_[kind];
+  var r = traktRequest_('GET', '/users/me/lists');
+  if (!r.ok) throw new Error(r.error);
+  var lists = r.body || [];
+  for (var i = 0; i < lists.length; i++) {
+    if (lists[i].name === name && lists[i].ids && lists[i].ids.slug) { slug = lists[i].ids.slug; break; }
+  }
+  if (!slug) {
+    var c = traktRequest_('POST', '/users/me/lists', {
+      name: name,
+      description: 'Managed by the Drive Renamer script: everything filed into the Google Drive library.',
+      privacy: 'private', display_numbers: false, allow_comments: false, sort_by: 'added', sort_how: 'desc'
+    });
+    if (!c.ok) throw new Error(c.error);
+    slug = c.body && c.body.ids && c.body.ids.slug;
+    if (!slug) throw new Error('Trakt created the list but returned no slug');
+  }
+  PropertiesService.getScriptProperties().setProperty(propName, slug);
+  return slug;
+}
+
+// Adds (or removes) TMDb ids on the kind's list. Never throws.
+// -> { ok, added, existing, deleted, notFound, error, code }
+function traktListChange_(kind, tmdbIds, remove) {
+  var key = kind === 'movie' ? 'movies' : 'shows';
+  var payload = {};
+  payload[key] = tmdbIds.map(function (id) { return { ids: { tmdb: Number(id) } }; });
+  for (var attempt = 0; attempt < 2; attempt++) {
+    var slug;
+    try { slug = traktListSlug_(kind); } catch (e) { return { ok: false, error: e.message, code: 0 }; }
+    var r = traktRequest_('POST', '/users/me/lists/' + encodeURIComponent(slug) + '/items' + (remove ? '/remove' : ''), payload);
+    if (r.code === 404 && attempt === 0) {
+      // The list was deleted on Trakt since we cached its slug — forget it and recreate once.
+      PropertiesService.getScriptProperties().deleteProperty(TRAKT_LIST_SLUG_PROP_[kind]);
+      continue;
+    }
+    if (!r.ok) return { ok: false, error: r.error, code: r.code };
+    var b = r.body || {};
+    var n = function (section) { return (b[section] && b[section][key]) || 0; };
+    return {
+      ok: true, added: n('added'), existing: n('existing'), deleted: n('deleted'),
+      notFound: (b.not_found && b.not_found[key]) ? b.not_found[key].length : 0
+    };
+  }
+  return { ok: false, error: 'Trakt list not found', code: 404 };
+}
+
+// ----- add after a successful rename -----
+// info: { kind: 'movie'|'show', tmdbId, title, year, folderName }
+// -> { attempted:false } when the feature is off, else
+//    { attempted:true, ok, info, line }
+function traktSyncAdd_(info, force) {
+  if (!traktConfigured_() || !info || !info.tmdbId) return { attempted: false };
+  var listName = TRAKT_LIST_NAME_[info.kind];
+  var failLine = function (why) { return { attempted: true, ok: false, info: info, line: '⚠️ Trakt: not added to ' + listName + ' — ' + why }; };
+
+  if (!force) {
+    if (g_traktDisabledReason_) return failLine(g_traktDisabledReason_);
+    var cached = info.kind === 'show' ? g_traktShowResult_[info.tmdbId] : null;
+    if (cached) {
+      return cached.ok
+        ? { attempted: true, ok: true, info: info, line: '🎞 Trakt: already in ' + listName + ' ✓' }
+        : cached;
+    }
+  }
+
+  var r;
+  try { r = traktListChange_(info.kind, [info.tmdbId], false); }
+  catch (e) { r = { ok: false, error: 'Trakt error: ' + e.message, code: 0 }; }
+
+  var out;
+  if (r.ok && (r.added + r.existing) === 0) {
+    out = failLine('Trakt has no ' + (info.kind === 'movie' ? 'movie' : 'show') + ' with TMDb id ' + info.tmdbId);
+  } else if (r.ok) {
+    out = { attempted: true, ok: true, info: info, line: '🎞 Trakt: ' + (r.added ? 'added to ' : 'already in ') + listName + ' ✓' };
+  } else {
+    out = failLine(r.error);
+  }
+
+  if (r.ok) {
+    g_traktFailStreak_ = 0;
+  } else if (!force) {
+    g_traktFailStreak_++;
+    if (r.code === 420 || r.code === 401 || g_traktFailStreak_ >= 3) {
+      g_traktDisabledReason_ = r.error + ' (skipping Trakt for the rest of this run)';
+    }
+  }
+  if (info.kind === 'show') g_traktShowResult_[info.tmdbId] = out;
+  return out;
+}
+
+function traktRetryKeyboard_(kind, tmdbId) {
+  return [[{ text: '🔁 Retry Trakt', callback_data: 'trk|' + (kind === 'movie' ? 'm' : 's') + '|' + tmdbId }]];
+}
+
+// Appends "moved + Trakt result" to the message that announced the move
+// (editing it in place); falls back to a short separate message if that
+// message can't be edited. No-op when the feature is off.
+function traktAnnounceRename_(msgRef, baseText, tr) {
+  if (!tr || !tr.attempted) return;
+  var kb = tr.ok ? null : traktRetryKeyboard_(tr.info.kind, tr.info.tmdbId);
+  var text = baseText + '\n\n✅ Moved to Drive\n' + tr.line;
+  if (msgRef && editMessageText_(msgRef.chatId, msgRef.messageId, text, kb)) return;
+  var fallback = '✅ Moved to Drive: ' + tr.info.title + (tr.info.year ? ' (' + tr.info.year + ')' : '') + '\n' + tr.line;
+  if (kb) sendTelegramKeyboard_(fallback, kb); else sendTelegram_(fallback, false);
+}
+
+function stripTraktLine_(text) {
+  return String(text || '').replace(/\n[^\n]*Trakt: [^\n]*$/, '').replace(/\s+$/, '');
+}
+
+// Handles a tap on "Retry Trakt" (callback_data "trk|m|<id>" / "trk|s|<id>").
+function handleTraktRetryCallback_(cq, kindCode, idText) {
+  var kind = kindCode === 'm' ? 'movie' : (kindCode === 's' ? 'show' : null);
+  var tmdbId = parseInt(idText, 10);
+  if (!kind || !tmdbId) { answerCallback_(cq.id, 'Unrecognized Trakt action.'); return; }
+  if (!traktConfigured_()) { answerCallback_(cq.id, 'Trakt is not set up (run traktAuthStart / traktAuthFinish).'); return; }
+  answerCallback_(cq.id, 'Retrying Trakt…');
+
+  var msg = cq.message || {};
+  var tr = traktSyncAdd_({ kind: kind, tmdbId: tmdbId, title: '' }, true);
+  var text = stripTraktLine_(msg.text || '(Trakt retry)') + '\n' + tr.line;
+  var kb = tr.ok ? null : traktRetryKeyboard_(kind, tmdbId);
+  if (msg.chat && msg.message_id && editMessageText_(msg.chat.id, msg.message_id, text, kb)) return;
+  if (kb) sendTelegramKeyboard_(text, kb); else sendTelegram_(text, false);
+}
+
+// ----- undo -----
+// After an Undo has moved the files out (and swept any emptied folders),
+// remove the title from its Trakt list — but ONLY if the Done library has no
+// folder left for it (another copy or another episode still there means it
+// still belongs on the list). Returns a note to append, '' if nothing to say.
+function traktUndoNote_(rawJson) {
+  if (!rawJson || !traktConfigured_()) return '';
+  var info;
+  try { info = JSON.parse(rawJson); } catch (e) { return ''; }
+  if (!info || !info.tmdbId || !info.kind) return '';
+  var listName = TRAKT_LIST_NAME_[info.kind];
+  try {
+    var root = info.kind === 'movie' ? getDoneFolder_() : getTvDoneFolder_();
+    if (info.folderName && root.getFoldersByName(info.folderName).hasNext()) {
+      return ' 🎞 Trakt: kept on ' + listName + ' (more of it is still in the library).';
+    }
+  } catch (e) {
+    return ' ⚠️ Trakt: left on ' + listName + ' — could not check the library (' + e.message + ').';
+  }
+  var r = traktListChange_(info.kind, [info.tmdbId], true);
+  if (!r.ok) return ' ⚠️ Trakt: could not remove from ' + listName + ' — ' + r.error + ' (remove it by hand on trakt.tv).';
+  return ' 🎞 Trakt: removed from ' + listName + '.';
+}
+
+// ----- manual helpers (run from the editor) -----
+
+// Creates both lists if missing and reports where things stand.
+function traktTestConnection() {
+  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET, then run traktAuthStart and traktAuthFinish.');
+  var lines = [];
+  ['movie', 'show'].forEach(function (kind) {
+    try {
+      var slug = traktListSlug_(kind);
+      lines.push(TRAKT_LIST_NAME_[kind] + ': ready (' + slug + ')');
+    } catch (e) {
+      lines.push(TRAKT_LIST_NAME_[kind] + ': FAILED — ' + e.message);
+    }
+  });
+  var msg = '🎞 Trakt check\n' + lines.join('\n');
+  Logger.log(msg);
+  sendTelegram_(msg, false);
+  return msg;
+}
+
+function resetTraktBackfill() {
+  PropertiesService.getScriptProperties().deleteProperty('TRAKT_BACKFILL_STATE');
+  Logger.log('Trakt backfill state cleared — the next backfillTraktLists run starts from the beginning.');
+}
+
+function tmdbIdFromName_(name) {
+  var m = /\[tmdbid-(\d+)\]/i.exec(name || '');
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Movie folders are named "Title (Year)" with no id; the id lives in the
+// video filename inside ("Title (Year) [tmdbid-123] [tags].mkv").
+function tmdbIdFromMovieFolder_(folder) {
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var id = tmdbIdFromName_(files.next().getName());
+    if (id) return id;
+  }
+  return null;
+}
+
+// One-time (re-runnable, resumable) backfill of what is ALREADY in the Done
+// folders: movie folders -> GDriveMovies, series folders -> GDriveSeries.
+// Adding is idempotent, so re-running is always safe. Works in ~4.5-minute
+// slices and remembers where it stopped (TRAKT_BACKFILL_STATE) — just run it
+// again until it reports "finished". With DRY_RUN=true it only counts.
+function backfillTraktLists() {
+  if (!traktConfigured_()) throw new Error('Trakt is not set up yet — set TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET, then run traktAuthStart and traktAuthFinish.');
+  var dry = getProp_('DRY_RUN') === 'true';
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { Logger.log('Another run is in progress — try again in a few minutes.'); return 'busy'; }
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var state = null;
+    if (!dry) { try { state = JSON.parse(getProp_('TRAKT_BACKFILL_STATE') || 'null'); } catch (e) { state = null; } }
+    state = state || { phase: 'movie', token: null, scanned: 0, added: 0, existing: 0, skipped: [], movies: 0, shows: 0, stopped: null };
+    var started = Date.now();
+    var budgetMs = 4.5 * 60 * 1000;
+    var save = function () { if (!dry) props.setProperty('TRAKT_BACKFILL_STATE', JSON.stringify(state)); };
+
+    while (state.phase !== 'done') {
+      var kind = state.phase;                            // 'movie' | 'show'
+      var root;
+      if (kind === 'movie') root = getDoneFolder_();
+      else { try { root = getTvDoneFolder_(); } catch (e) { state.phase = 'done'; break; } }
+
+      var it = state.token ? DriveApp.continueFolderIterator(state.token) : root.getFolders();
+      var batch = [];
+      var batchStartToken = state.token;
+      var timeUp = false;
+      var failed = false;
+
+      var flush = function () {
+        if (!batch.length) return true;
+        if (dry) { state.added += batch.length; batch = []; return true; }
+        var r = traktListChange_(kind, batch, false);
+        if (!r.ok) {
+          state.stopped = r.error;
+          state.token = batchStartToken;                 // resume from before this batch; adds are idempotent
+          return false;
+        }
+        state.added += r.added;
+        state.existing += r.existing;
+        batch = [];
+        batchStartToken = it.getContinuationToken();
+        return true;
+      };
+
+      while (it.hasNext()) {
+        if (Date.now() - started > budgetMs) { timeUp = true; break; }
+        var f = it.next();
+        state.scanned++;
+        var id = kind === 'movie' ? tmdbIdFromMovieFolder_(f) : tmdbIdFromName_(f.getName());
+        if (!id) { if (state.skipped.length < 40) state.skipped.push(f.getName()); continue; }
+        batch.push(id);
+        if (kind === 'movie') state.movies++; else state.shows++;
+        if (batch.length >= 100 && !flush()) { failed = true; break; }
+      }
+      if (!failed && !flush()) failed = true;
+
+      if (failed) {
+        save();
+        var failMsg = '⚠️ Trakt backfill stopped: ' + state.stopped + '\nProgress is saved — fix the cause, then run backfillTraktLists again.';
+        Logger.log(failMsg);
+        sendTelegram_(failMsg, false);
+        return 'stopped';
+      }
+      if (timeUp) {
+        state.token = it.getContinuationToken();
+        save();
+        Logger.log('Trakt backfill: time slice used up (' + state.scanned + ' folders scanned so far) — run backfillTraktLists again to continue.');
+        return 'partial';
+      }
+      state.token = null;
+      state.phase = kind === 'movie' ? 'show' : 'done';
+    }
+
+    var summary = (dry ? '🧪 Trakt backfill (dry run, nothing sent): ' : '✅ Trakt backfill finished: ')
+      + state.movies + ' movie folder(s) -> GDriveMovies, ' + state.shows + ' series folder(s) -> GDriveSeries'
+      + (dry ? '' : ' (' + state.added + ' newly added, ' + state.existing + ' were already there)')
+      + '.';
+    if (state.skipped.length) {
+      summary += '\n' + state.skipped.length + ' folder(s) skipped (no [tmdbid-…] found in the name):\n  ' + state.skipped.slice(0, 15).join('\n  ')
+        + (state.skipped.length > 15 ? '\n  …and ' + (state.skipped.length - 15) + ' more (see the log)' : '');
+      Logger.log('Skipped folders: ' + state.skipped.join(' | '));
+    }
+    Logger.log(summary);
+    sendTelegram_(summary, false);
+    if (!dry) props.deleteProperty('TRAKT_BACKFILL_STATE');
+    return 'finished';
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -1420,6 +1924,12 @@ function handleCallbackQuery_(cq) {
     return;
   }
 
+  // Added 2026-11-21: "Retry Trakt" button ("trk|m|<tmdbId>" / "trk|s|<tmdbId>").
+  if (parts[0] === 'trk' && parts.length === 3) {
+    handleTraktRetryCallback_(cq, parts[1], parts[2]);
+    return;
+  }
+
   if (parts[0] !== 'rr' || parts.length !== 3) {
     answerCallback_(cq.id, 'Unrecognized action.');
     return;
@@ -1468,12 +1978,15 @@ function handleCallbackQuery_(cq) {
   // now) sends its OWN separate Keep OLD/Keep NEW message - a plain
   // "✅ ... done" here would misreport it as finished when it's actually
   // still awaiting a second decision.
+  var pickText = result.deferredToDuplicateButtons
+    ? ('➡️ ' + record.videoName + '\n→ ' + result.summary)
+    : (result.ok
+      ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
+      : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error));
+  var pickTr = result.trakt && result.trakt.attempted ? result.trakt : null;
   editMessageText_(record.chatId, record.messageId,
-    result.deferredToDuplicateButtons
-      ? ('➡️ ' + record.videoName + '\n→ ' + result.summary)
-      : (result.ok
-        ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
-        : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error)));
+    pickTr ? (pickText + '\n' + pickTr.line) : pickText,
+    pickTr && !pickTr.ok ? traktRetryKeyboard_(pickTr.info.kind, pickTr.info.tmdbId) : null);
 }
 
 // Added 2026-11-10: handles a tap on the Keep OLD / Keep NEW duplicate
@@ -1496,10 +2009,13 @@ function handleDuplicateCallback_(cq, token, choice) {
   delete pending[token];
   setPendingReviews_(pending);
 
+  var dupText = result.ok
+    ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
+    : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error);
+  var dupTr = result.trakt && result.trakt.attempted ? result.trakt : null;
   editMessageText_(record.chatId, record.messageId,
-    result.ok
-      ? ('✅ ' + record.videoName + '\n→ ' + result.summary)
-      : ('⚠️ Resolution failed: ' + record.videoName + '\n' + result.error));
+    dupTr ? (dupText + '\n' + dupTr.line) : dupText,
+    dupTr && !dupTr.ok ? traktRetryKeyboard_(dupTr.info.kind, dupTr.info.tmdbId) : null);
 }
 
 // Performs the actual rename/move for a button-resolved review item. The
@@ -1568,7 +2084,8 @@ function finalizeReviewPick_(record, candidate) {
       destFolderId: existingFolder.getId(),
       existingFiles: existingFiles,
       finalVideoName: finalVideoName,
-      finalBase: finalBase
+      finalBase: finalBase,
+      traktInfo: { kind: 'movie', tmdbId: movie.tmdbId, title: movie.title, year: movie.year, folderName: folderName }
     });
 
     return {
@@ -1591,6 +2108,7 @@ function finalizeReviewPick_(record, candidate) {
   }
 
   sendTelegram_('🔄 Renaming & moving (button pick)\n' + record.videoName + '\n→ ' + folderName + '/' + finalVideoName, false);
+  var pickTraktInfo = { kind: 'movie', tmdbId: movie.tmdbId, title: movie.title, year: movie.year, folderName: folderName };
 
   try {
     var destFolder = getOrCreateFolder_(doneFolder, folderName);
@@ -1622,7 +2140,8 @@ function finalizeReviewPick_(record, candidate) {
       newName: finalVideoName,
       newFolderId: destFolder.getId(),
       newFolderDisplay: 'Done/' + folderName,
-      subs: subMoves.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; })
+      subs: subMoves.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; }),
+      trakt: pickTraktInfo
     });
 
     // Clean up the now-emptied original folder (see the comment at
@@ -1641,7 +2160,9 @@ function finalizeReviewPick_(record, candidate) {
       }
     }
 
-    return { ok: true, summary: folderName + '/' + finalVideoName };
+    var pickResult = { ok: true, summary: folderName + '/' + finalVideoName };
+    try { pickResult.trakt = traktSyncAdd_(pickTraktInfo); } catch (traktErr) { Logger.log('Trakt step skipped: ' + traktErr.message); }
+    return pickResult;
   } catch (e) {
     var errMsg = '⚠️ Rename/move FAILED (button pick)\n' + record.videoName
       + '\n(intended) → ' + folderName + '/' + finalVideoName
@@ -1703,18 +2224,26 @@ function answerCallback_(callbackQueryId, text) {
   }
 }
 
-function editMessageText_(chatId, messageId, text) {
+// Returns true only if Telegram accepted the edit (HTTP 200), false
+// otherwise — existing callers ignore the return value. keyboard (optional)
+// is an inline_keyboard array; omitting it removes any buttons the message
+// had, which is what every pre-Trakt caller already relied on.
+function editMessageText_(chatId, messageId, text, keyboard) {
   var token = getProp_('TELEGRAM_BOT_TOKEN');
-  if (!token) return;
+  if (!token) return false;
   try {
-    UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/editMessageText', {
+    var payload = { chat_id: chatId, message_id: messageId, text: text };
+    if (keyboard) payload.reply_markup = { inline_keyboard: keyboard };
+    var res = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/editMessageText', {
       method: 'post',
       contentType: 'application/json',
-      payload: JSON.stringify({ chat_id: chatId, message_id: messageId, text: text }),
+      payload: JSON.stringify(payload),
       muteHttpExceptions: true
     });
+    return res && res.getResponseCode ? res.getResponseCode() === 200 : false;
   } catch (e) {
     Logger.log('editMessageText_ threw: ' + e.message);
+    return false;
   }
 }
 
@@ -2056,13 +2585,17 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
         destFolderId: existingFolder.getId(),
         existingFiles: existingFiles,
         finalVideoName: finalVideoName,
-        finalBase: finalBase
+        finalBase: finalBase,
+        traktInfo: { kind: 'movie', tmdbId: movie.tmdbId, title: movie.title, year: movie.year, folderName: folderName }
       });
       return 'issue';
     }
 
+    var traktInfo = { kind: 'movie', tmdbId: movie.tmdbId, title: movie.title, year: movie.year, folderName: folderName };
+
     if (dryRun) {
       Logger.log('[DRY RUN] "' + video.name + '"' + folderNote + ' -> Done folder: "' + folderName + '/' + finalVideoName + '"');
+      if (traktConfigured_()) Logger.log('[DRY RUN]   would add TMDb ' + movie.tmdbId + ' to the Trakt list ' + TRAKT_LIST_NAME_.movie);
       subRenames.forEach(function (s) {
         Logger.log('[DRY RUN]   subtitle "' + s.oldName + '" -> "' + s.newName + '"');
       });
@@ -2073,7 +2606,7 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
     subRenames.forEach(function (s) {
       preMsg += '\n(subtitle) ' + s.oldName + '\n→ ' + folderName + '/' + s.newName;
     });
-    sendTelegram_(preMsg, false);
+    var preRef = sendTelegram_(preMsg, false);
 
     try {
       var destFolder = getOrCreateFolder_(doneFolder, folderName);
@@ -2092,9 +2625,14 @@ function processVideo_(video, matchedSubs, reviewFolder, doneFolder, dryRun) {
         newName: finalVideoName,
         newFolderId: destFolder.getId(),
         newFolderDisplay: 'Done/' + folderName,
-        subs: subRenames.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; })
+        subs: subRenames.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; }),
+        trakt: traktInfo
       });
       Logger.log('Processed: ' + finalVideoName);
+      // Trakt is best-effort and runs AFTER the move + undo log, so nothing
+      // it does can undo or fail an already-successful rename.
+      try { traktAnnounceRename_(preRef, preMsg, traktSyncAdd_(traktInfo)); }
+      catch (traktErr) { Logger.log('Trakt step skipped: ' + traktErr.message); }
       return 'success';
     } catch (e) {
       var errMsg = '⚠️ Rename/move FAILED' + folderNote + '\n' + video.name
@@ -2278,13 +2816,17 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
         destFolderId: destSeasonFolderId,
         existingFiles: existingEpFiles,
         finalVideoName: finalVideoName,
-        finalBase: finalBase
+        finalBase: finalBase,
+        traktInfo: { kind: 'show', tmdbId: series.tmdbId, title: series.title, year: series.year, folderName: seriesFolderName }
       });
       return 'issue';
     }
 
+    var tvTraktInfo = { kind: 'show', tmdbId: series.tmdbId, title: series.title, year: series.year, folderName: seriesFolderName };
+
     if (dryRun) {
       Logger.log('[DRY RUN] "' + video.name + '"' + folderNote + ' -> TV Done folder: "' + seriesFolderName + '/' + seasonFolderName + '/' + finalVideoName + '"');
+      if (traktConfigured_()) Logger.log('[DRY RUN]   would add TMDb show ' + series.tmdbId + ' to the Trakt list ' + TRAKT_LIST_NAME_.show);
       subRenames.forEach(function (s) { Logger.log('[DRY RUN]   subtitle "' + s.oldName + '" -> "' + s.newName + '"'); });
       return 'success';
     }
@@ -2293,7 +2835,7 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
     subRenames.forEach(function (s) {
       preMsg += '\n(subtitle) ' + s.oldName + '\n→ ' + seriesFolderName + '/' + seasonFolderName + '/' + s.newName;
     });
-    sendTelegram_(preMsg, false);
+    var tvPreRef = sendTelegram_(preMsg, false);
 
     try {
       var seriesFolder = getOrCreateFolder_(getTvDoneFolder_(), seriesFolderName);
@@ -2313,9 +2855,12 @@ function processTvEpisode_(video, matchedSubs, reviewFolder, dryRun, folderNote,
         newName: finalVideoName,
         newFolderId: seasonFolder.getId(),
         newFolderDisplay: 'TV Done/' + seriesFolderName + '/' + seasonFolderName,
-        subs: subRenames.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; })
+        subs: subRenames.map(function (s) { return { fileId: s.file.getId(), oldName: s.oldName, newName: s.newName }; }),
+        trakt: tvTraktInfo
       });
       Logger.log('Processed TV episode: ' + finalVideoName);
+      try { traktAnnounceRename_(tvPreRef, preMsg, traktSyncAdd_(tvTraktInfo)); }
+      catch (traktErr) { Logger.log('Trakt step skipped: ' + traktErr.message); }
       return 'success';
     } catch (e) {
       var errMsg = '⚠️ Rename/move FAILED (TV episode)' + folderNote + '\n' + video.name
@@ -2790,7 +3335,7 @@ function sendReviewWithButtons_(video, matchedSubs, reviewFolder, parsed, lookup
 // opts: { video, matchedSubs, reviewFolder, dryRun, folderNote, moveFileNow,
 //         mediaKind ('Movie'|'TV'), matchedLabel, existingLocationLabel,
 //         destFolderId, existingFiles ([{id,name,size}]), finalVideoName,
-//         finalBase }
+//         finalBase, traktInfo (optional, see traktSyncAdd_) }
 function sendDuplicateDecisionButtons_(opts) {
   var video = opts.video, matchedSubs = opts.matchedSubs, reviewFolder = opts.reviewFolder,
     dryRun = opts.dryRun, folderNote = opts.folderNote, moveFileNow = opts.moveFileNow;
@@ -2845,6 +3390,7 @@ function sendDuplicateDecisionButtons_(opts) {
     existingFileIds: opts.existingFiles.map(function (f) { return f.id; }),
     finalVideoName: opts.finalVideoName,
     finalBase: opts.finalBase,
+    trakt: opts.traktInfo || null,
     chatId: sent.chatId,
     messageId: sent.messageId,
     createdAt: Date.now()
@@ -2945,7 +3491,8 @@ function resolveDuplicateDecision_(record, choice) {
         newName: record.finalVideoName,
         newFolderId: destFolder.getId(),
         newFolderDisplay: record.existingLocationLabel,
-        subs: subMoves
+        subs: subMoves,
+        trakt: record.trakt || null
       });
 
       if (record.videoParentFolderId) {
@@ -2955,7 +3502,11 @@ function resolveDuplicateDecision_(record, choice) {
         } catch (e) { /* best effort cleanup only */ }
       }
 
-      return { ok: true, summary: 'Swapped in the new file -> ' + record.existingLocationLabel + '/' + record.finalVideoName + '. Old copy moved to RenamerReview/Already Exist.' };
+      var swapResult = { ok: true, summary: 'Swapped in the new file -> ' + record.existingLocationLabel + '/' + record.finalVideoName + '. Old copy moved to RenamerReview/Already Exist.' };
+      if (record.trakt) {
+        try { swapResult.trakt = traktSyncAdd_(record.trakt); } catch (traktErr) { Logger.log('Trakt step skipped: ' + traktErr.message); }
+      }
+      return swapResult;
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -3594,6 +4145,20 @@ function sendTelegram_(text, dryRun) {
     }
   }
   Utilities.sleep(TELEGRAM_PACING_MS);
+
+  // Added 2026-11-21: hand back where the message landed so a caller can
+  // edit it later (the rename notice gets its "moved + Trakt" result
+  // appended in place). null when the send failed or the reply couldn't be
+  // read; every pre-existing caller ignores the return value.
+  if (res && res.getResponseCode() === 200) {
+    try {
+      var sentBody = JSON.parse(res.getContentText());
+      return { chatId: sentBody.result.chat.id, messageId: sentBody.result.message_id };
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
 }
 
 // ---------- small utilities ----------

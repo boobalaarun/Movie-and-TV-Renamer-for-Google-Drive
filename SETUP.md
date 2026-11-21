@@ -28,6 +28,14 @@ after you tap a multi-candidate button — no longer just sits there as a
 dead-end text message; it offers a resolution. See "Folder structure",
 "Resolving a RenamerReview item", and "TV Shows" below.
 
+**Changed 2026-11-21 — optional Trakt lists.** Every movie that lands in
+Done is added to a private Trakt list **GDriveMovies**, every TV show that
+gets an episode filed is added to **GDriveSeries**, and the result shows up
+in the same Telegram message as the move (with a **Retry Trakt** button if
+Trakt was unreachable). Undo takes the title off the list again. Off until
+you set it up — see **Trakt lists** below, and read the list-size warning
+there *before* you start.
+
 ## Folder structure
 
 Pick (or create) **two separate folders anywhere in Drive** — they don't
@@ -350,6 +358,94 @@ message, and the Notes cell records what happened.
   automatically. Only log rows are ever deleted this way, never media.
 - Logging is best-effort: if the Sheets API hiccups twice in a row, that
   one rename still succeeds but has no Undo row.
+- **Trakt:** if Trakt lists are set up (below), Undo also removes the title
+  from GDriveMovies / GDriveSeries — but only once **nothing of it is left
+  in your Done library** (a second copy of a movie, or other episodes of a
+  show, keep it on the list). The Notes cell and Telegram message say what
+  happened; if Trakt is unreachable at that moment the revert still
+  succeeds and you're told to remove the title by hand on trakt.tv. Rows
+  logged before this feature existed have no Trakt info and are skipped.
+  (A 14th, hidden column "Trakt JSON" holds that info; an existing History
+  sheet gets the column added automatically the first time a rename is
+  logged.)
+
+## Trakt lists (optional, added 2026-11-21)
+
+**What it does**
+- A movie filed into Done → added to your private Trakt list **GDriveMovies**
+  (by TMDb id, no extra lookup). Works for auto-matched files, candidate
+  button picks, and a **Keep NEW** duplicate swap.
+- A TV episode filed → its **show** is added to **GDriveSeries** (once per
+  show, not per episode — a whole season dropped in costs one Trakt call).
+- The result is appended to the same Telegram message that announced the
+  move: `✅ Moved to Drive` + `🎞 Trakt: added to GDriveMovies ✓` (or
+  `already in …` when it was there).
+- **If Trakt fails, the file is still moved.** The message says
+  `⚠️ Trakt: not added to GDriveMovies — <reason>` and carries a
+  **🔁 Retry Trakt** button. Tap it any time; it re-tries just the Trakt
+  step and rewrites that one line.
+- After 3 failures in a row (or a login/account-limit error) the rest of
+  that run skips Trakt instead of burning its time budget; those messages
+  say so and still have the Retry button.
+- **Keep OLD** adds nothing (nothing new entered the library). Dry run never
+  calls Trakt.
+- Undo removes the title again (see **Undo / Renamer History**).
+- With Trakt not set up, nothing changes at all — no extra messages, no
+  edits.
+
+**⚠️ Check your Trakt account limits first.** Trakt caps list sizes. Per
+Trakt's own "Updating Trakt Limits for 2026" announcement, a **free**
+account allows 250 items per personal list and 1,000 across all personal
+lists; **VIP** allows 5,000 per list and 100,000 total. Limits change, so
+confirm on trakt.tv. A library bigger than your cap will fill the list and
+then every further add fails with `Trakt account limit reached` — the file
+move is never affected, but the list stops growing, and `backfillTraktLists`
+stops at the cap and tells you. If your library is large and you're on a
+free account, this feature will not hold all of it.
+
+**One-time setup**
+1. Create an API app at trakt.tv/oauth/applications → **New Application**.
+   Name: anything. Redirect URI: `urn:ietf:wg:oauth:2.0:oob`. Save, then copy
+   the **Client ID** and **Client Secret**.
+2. Add two Script Properties (or fill the matching rows in the Settings
+   Sheet — re-run `setupSettingsSheet` first so the new rows appear):
+   `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`.
+3. Run **`traktAuthStart`**. It sends a Telegram message with a short code
+   and `https://trakt.tv/activate`. Open that page, enter the code, approve.
+4. Run **`traktAuthFinish`**. It waits up to ~90 seconds for your approval
+   and stores the login. If it says "Not approved yet", approve and run it
+   again. (If the code expired, just run `traktAuthStart` again.)
+5. Run **`traktTestConnection`** — creates the two private lists if missing
+   (it looks them up by name first, so it never makes duplicates) and
+   confirms by Telegram.
+6. **Redeploy the Web App** (Deploy → Manage deployments → ✏️ → New version
+   → Deploy). The Retry button, and the Trakt line after a button pick or a
+   Keep NEW tap, run through the deployed Web App — see the warning in step 8.
+
+The login refreshes itself. If Trakt ever revokes it, the Telegram message
+will say so — re-run `traktAuthStart` / `traktAuthFinish`.
+
+**Backfilling what's already in Done** — run **`backfillTraktLists`**:
+- Movie folders are read for the `[tmdbid-…]` in their video filenames;
+  series folders for the `[tmdbid-…]` in the folder name. Folders with no id
+  anywhere (older renames, hand-made folders) are skipped and listed in the
+  summary.
+- Adds in batches of 100, so it respects Trakt's write limit. It works in
+  ~4.5-minute slices and remembers where it stopped — if it returns
+  "partial", just run it again until Telegram says **finished**.
+- Safe to re-run any time (already-listed items are just counted as "already
+  there"). If it hits your account limit it stops, keeps its place, and tells
+  you; `resetTraktBackfill` clears the saved place to start over.
+- With `DRY_RUN=true` it only counts and sends nothing to Trakt — a cheap
+  way to see how many titles you'd be adding before deciding.
+
+**Limits worth knowing**
+- One-way: Drive → Trakt. Deleting or moving a file in Drive by hand does
+  **not** remove it from Trakt (only the Undo checkbox does).
+- Each Trakt write is paced at ~1 second, so a big batch of renames takes a
+  little longer per file when Trakt is on.
+- A title Trakt doesn't know by its TMDb id is reported as such rather than
+  silently counted as added.
 
 ## TV Shows (optional, added 2026-11-02)
 
@@ -412,8 +508,8 @@ up on the next run.
 
 ## 8. (Optional) Enable tap-to-resolve buttons
 
-Two different situations get Telegram buttons instead of a plain text
-message, and both need this same one-time setup:
+Three different situations get Telegram buttons instead of a plain text
+message, and all need this same one-time setup:
 - **Multi-candidate reviews (movies only):** when TMDb turns up multiple
   real candidates for the same title and year (e.g. two unrelated movies
   both titled "Paradise" released in 2026), the message includes one
@@ -422,6 +518,9 @@ message, and both need this same one-time setup:
 - **Duplicate decisions (movies and TV):** when the file already exists in
   Done, the message includes **📦 Keep OLD (existing)** and **🆕 Keep NEW
   (incoming)** buttons, with both files' sizes shown.
+- **Trakt retry (movies and TV, only if Trakt lists are set up):** a
+  **🔁 Retry Trakt** button when adding to a Trakt list failed. See **Trakt
+  lists** above.
 
 Tapping a button — any time later, minutes or days — resolves it
 immediately: files, renames, and moves whatever that choice implies.
