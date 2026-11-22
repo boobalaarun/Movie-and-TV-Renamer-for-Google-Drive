@@ -22,7 +22,7 @@ beyond Google's and TMDb's free tiers.
   Apps Script. A duplicate shows both files' sizes and a Keep OLD/Keep NEW
   choice, for both movies and TV
 - **Trakt lists** (optional): every movie filed goes into a private Trakt
-  list `GDriveMovies` and every TV show into `GDriveSeries`, reported in the
+  list `GDrive Movies` and every TV show into `GDrive Series`, reported in the
   same Telegram message — with a Retry button if Trakt is down. Undo removes
   it again, and a one-time backfill covers what's already in your library.
   Note Trakt caps list sizes on free accounts — see SETUP.md

@@ -1388,8 +1388,8 @@ function performUndo_(sheet, row) {
 // ---------- Trakt lists (added 2026-11-21) ----------
 //
 // Optional. Every movie that lands in the Done folder is added to a private
-// Trakt custom list named GDriveMovies, and every TV show that gets an
-// episode filed is added (once, at SHOW level) to GDriveSeries. The result
+// Trakt custom list named GDrive Movies, and every TV show that gets an
+// episode filed is added (once, at SHOW level) to GDrive Series. The result
 // is appended to the same Telegram message that announced the move. If Trakt
 // can't be reached, the file is STILL moved — the message says so and offers
 // a "Retry Trakt" button instead. Undo removes the title again, but only once
@@ -1406,7 +1406,11 @@ function performUndo_(sheet, row) {
 // text Telegram hands back with the tap.
 
 var TRAKT_API_ = 'https://api.trakt.tv';
-var TRAKT_LIST_NAME_ = { movie: 'GDriveMovies', show: 'GDriveSeries' };
+var TRAKT_LIST_NAME_ = { movie: 'GDrive Movies', show: 'GDrive Series' };
+// Renamed 2026-11-22 from 'GDriveMovies' / 'GDriveSeries' (no spaces). The old
+// names are still recognised when looking a list up by name, so a list created
+// under the old name is found, never duplicated.
+var TRAKT_LIST_LEGACY_NAME_ = { movie: 'GDriveMovies', show: 'GDriveSeries' };
 var TRAKT_LIST_SLUG_PROP_ = { movie: 'TRAKT_LIST_SLUG_MOVIES', show: 'TRAKT_LIST_SLUG_SERIES' };
 var TRAKT_WRITE_PACING_MS_ = 1100; // Trakt allows ~1 write/second
 var TRAKT_REAUTH_MSG_ = 'Trakt login expired or was revoked — run traktAuthStart, approve the code on trakt.tv, then run traktAuthFinish.';
@@ -1481,7 +1485,7 @@ function traktAuthFinish() {
       props.deleteProperty('TRAKT_DEVICE_CODE');
       props.deleteProperty('TRAKT_DEVICE_EXPIRES_AT');
       props.deleteProperty('TRAKT_DEVICE_INTERVAL');
-      var ok = '✅ Trakt connected. New renames will be added to the GDriveMovies / GDriveSeries lists. Run traktTestConnection to create the lists now, and backfillTraktLists to add what is already in Done.';
+      var ok = '✅ Trakt connected. New renames will be added to the GDrive Movies / GDrive Series lists. Run traktTestConnection to create the lists now, and backfillTraktLists to add what is already in Done.';
       Logger.log(ok);
       sendTelegram_(ok, false);
       return 'connected';
@@ -1570,7 +1574,7 @@ function traktRequest_(method, path, payload) {
     var text = res.getContentText();
     var body = null;
     try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
-    if (code >= 200 && code < 300) return { ok: true, code: code, body: body };
+    if (code >= 200 && code < 300) return { ok: true, code: code, body: body, headers: res.getHeaders ? res.getHeaders() : {} };
     return { ok: false, code: code, body: body, error: traktErrorText_(code, text) };
   }
   return { ok: false, code: 429, error: 'Trakt rate limit — try again in a minute' };
@@ -1599,8 +1603,11 @@ function traktListSlug_(kind) {
   var r = traktRequest_('GET', '/users/me/lists');
   if (!r.ok) throw new Error(r.error);
   var lists = r.body || [];
-  for (var i = 0; i < lists.length; i++) {
-    if (lists[i].name === name && lists[i].ids && lists[i].ids.slug) { slug = lists[i].ids.slug; break; }
+  var wanted = [name, TRAKT_LIST_LEGACY_NAME_[kind]];
+  for (var w = 0; w < wanted.length && !slug; w++) {
+    for (var i = 0; i < lists.length; i++) {
+      if (lists[i].name === wanted[w] && lists[i].ids && lists[i].ids.slug) { slug = lists[i].ids.slug; break; }
+    }
   }
   if (!slug) {
     var c = traktRequest_('POST', '/users/me/lists', {
@@ -1766,6 +1773,75 @@ function traktTestConnection() {
   return msg;
 }
 
+// All TMDb ids currently on one of the two Trakt lists (paged). Read-only.
+function traktListTmdbIds_(kind) {
+  var key = kind === 'movie' ? 'movies' : 'shows';
+  var slug;
+  try { slug = traktListSlug_(kind); } catch (e) { return { ok: false, error: e.message }; }
+  var ids = {}, page = 1, pages = 1, limit = 500;
+  do {
+    var r = traktRequest_('GET', '/users/me/lists/' + encodeURIComponent(slug) + '/items/' + key + '?page=' + page + '&limit=' + limit);
+    if (!r.ok) return { ok: false, error: r.error };
+    var body = r.body || [];
+    body.forEach(function (it) {
+      var o = it.movie || it.show;
+      if (o && o.ids && o.ids.tmdb) ids[o.ids.tmdb] = true;
+    });
+    var hdrs = r.headers || {};
+    var pc = parseInt(hdrs['X-Pagination-Page-Count'] || hdrs['x-pagination-page-count'] || '', 10);
+    pages = isNaN(pc) ? (body.length >= limit ? page + 1 : page) : pc;
+    page++;
+  } while (page <= pages);
+  return { ok: true, ids: ids };
+}
+
+// Read-only check (run from the editor): compares what is in your Done
+// folders with what is actually on the two Trakt lists, and says exactly
+// which titles are missing and why — no id in the folder name, two folders
+// sharing one TMDb id (they collapse into ONE list entry, which is the usual
+// reason a count comes up short), or a real id that is simply not on the
+// list. Changes nothing. After fixing a cause, run backfillTraktLists again.
+function findMissingFromTrakt() {
+  if (!traktConfigured_()) throw new Error('Trakt is not set up yet.');
+  var started = Date.now(), budgetMs = 4.5 * 60 * 1000;
+  var report = [];
+  var kinds = [['movie', 'GDrive Movies'], ['show', 'GDrive Series']];
+  for (var k = 0; k < kinds.length; k++) {
+    var kind = kinds[k][0], listName = TRAKT_LIST_NAME_[kind];
+    var root;
+    try { root = kind === 'movie' ? getDoneFolder_() : getTvDoneFolder_(); } catch (e) { continue; }
+
+    var onList = traktListTmdbIds_(kind);
+    if (!onList.ok) { report.push(listName + ': could not read the Trakt list — ' + onList.error); continue; }
+
+    var byId = {}, noId = [], total = 0;
+    var it = root.getFolders();
+    while (it.hasNext()) {
+      if (Date.now() - started > budgetMs) { report.push(listName + ': ran out of time scanning — run findMissingFromTrakt again.'); break; }
+      var f = it.next(); total++;
+      var id = kind === 'movie' ? tmdbIdFromMovieFolder_(f) : tmdbIdFromName_(f.getName());
+      if (!id) { noId.push(f.getName()); continue; }
+      (byId[id] = byId[id] || []).push(f.getName());
+    }
+
+    var missing = [], dupes = [];
+    Object.keys(byId).forEach(function (id) {
+      if (byId[id].length > 1) dupes.push(byId[id].join('  +  ') + '  (TMDb ' + id + ')');
+      if (!onList.ids[id]) missing.push(byId[id][0] + '  (TMDb ' + id + ')');
+    });
+    var distinct = Object.keys(byId).length;
+    report.push(listName + ': ' + total + ' folder(s) in Done, ' + distinct + ' distinct TMDb id(s), ' + Object.keys(onList.ids).length + ' on the Trakt list.');
+    if (dupes.length) report.push('  Same TMDb id in more than one folder (they count ONCE on Trakt):\n    ' + dupes.slice(0, 20).join('\n    '));
+    if (noId.length) report.push('  No [tmdbid-…] found (never sent to Trakt):\n    ' + noId.slice(0, 20).join('\n    '));
+    if (missing.length) report.push('  Has an id but is NOT on the list:\n    ' + missing.slice(0, 20).join('\n    ') + '\n  -> run backfillTraktLists again; if it stays missing, Trakt does not know that TMDb id.');
+    if (!dupes.length && !noId.length && !missing.length) report.push('  Everything in Done is accounted for.');
+  }
+  var msg = '🔎 Trakt check\n' + report.join('\n');
+  Logger.log(msg);
+  sendTelegram_(msg.substring(0, 3900), false);
+  return msg;
+}
+
 function resetTraktBackfill() {
   PropertiesService.getScriptProperties().deleteProperty('TRAKT_BACKFILL_STATE');
   Logger.log('Trakt backfill state cleared — the next backfillTraktLists run starts from the beginning.');
@@ -1788,7 +1864,7 @@ function tmdbIdFromMovieFolder_(folder) {
 }
 
 // One-time (re-runnable, resumable) backfill of what is ALREADY in the Done
-// folders: movie folders -> GDriveMovies, series folders -> GDriveSeries.
+// folders: movie folders -> GDrive Movies, series folders -> GDrive Series.
 // Adding is idempotent, so re-running is always safe. Works in ~4.5-minute
 // slices and remembers where it stopped (TRAKT_BACKFILL_STATE) — just run it
 // again until it reports "finished". With DRY_RUN=true it only counts.
@@ -1829,6 +1905,7 @@ function backfillTraktLists() {
         }
         state.added += r.added;
         state.existing += r.existing;
+        state.notRecognised = (state.notRecognised || 0) + (r.notFound || 0);
         batch = [];
         batchStartToken = it.getContinuationToken();
         return true;
@@ -1864,9 +1941,12 @@ function backfillTraktLists() {
     }
 
     var summary = (dry ? '🧪 Trakt backfill (dry run, nothing sent): ' : '✅ Trakt backfill finished: ')
-      + state.movies + ' movie folder(s) -> GDriveMovies, ' + state.shows + ' series folder(s) -> GDriveSeries'
+      + state.movies + ' movie folder(s) -> GDrive Movies, ' + state.shows + ' series folder(s) -> GDrive Series'
       + (dry ? '' : ' (' + state.added + ' newly added, ' + state.existing + ' were already there)')
       + '.';
+    if (state.notRecognised) {
+      summary += '\n' + state.notRecognised + ' title(s) were not recognised by Trakt (its database has no entry for that TMDb id) — run findMissingFromTrakt to see which.';
+    }
     if (state.skipped.length) {
       summary += '\n' + state.skipped.length + ' folder(s) skipped (no [tmdbid-…] found in the name):\n  ' + state.skipped.slice(0, 15).join('\n  ')
         + (state.skipped.length > 15 ? '\n  …and ' + (state.skipped.length - 15) + ' more (see the log)' : '');

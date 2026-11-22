@@ -29,8 +29,8 @@ dead-end text message; it offers a resolution. See "Folder structure",
 "Resolving a RenamerReview item", and "TV Shows" below.
 
 **Changed 2026-11-21 — optional Trakt lists.** Every movie that lands in
-Done is added to a private Trakt list **GDriveMovies**, every TV show that
-gets an episode filed is added to **GDriveSeries**, and the result shows up
+Done is added to a private Trakt list **GDrive Movies**, every TV show that
+gets an episode filed is added to **GDrive Series**, and the result shows up
 in the same Telegram message as the move (with a **Retry Trakt** button if
 Trakt was unreachable). Undo takes the title off the list again. Off until
 you set it up — see **Trakt lists** below, and read the list-size warning
@@ -359,7 +359,7 @@ message, and the Notes cell records what happened.
 - Logging is best-effort: if the Sheets API hiccups twice in a row, that
   one rename still succeeds but has no Undo row.
 - **Trakt:** if Trakt lists are set up (below), Undo also removes the title
-  from GDriveMovies / GDriveSeries — but only once **nothing of it is left
+  from GDrive Movies / GDrive Series — but only once **nothing of it is left
   in your Done library** (a second copy of a movie, or other episodes of a
   show, keep it on the list). The Notes cell and Telegram message say what
   happened; if Trakt is unreachable at that moment the revert still
@@ -372,16 +372,16 @@ message, and the Notes cell records what happened.
 ## Trakt lists (optional, added 2026-11-21)
 
 **What it does**
-- A movie filed into Done → added to your private Trakt list **GDriveMovies**
+- A movie filed into Done → added to your private Trakt list **GDrive Movies**
   (by TMDb id, no extra lookup). Works for auto-matched files, candidate
   button picks, and a **Keep NEW** duplicate swap.
-- A TV episode filed → its **show** is added to **GDriveSeries** (once per
+- A TV episode filed → its **show** is added to **GDrive Series** (once per
   show, not per episode — a whole season dropped in costs one Trakt call).
 - The result is appended to the same Telegram message that announced the
-  move: `✅ Moved to Drive` + `🎞 Trakt: added to GDriveMovies ✓` (or
+  move: `✅ Moved to Drive` + `🎞 Trakt: added to GDrive Movies ✓` (or
   `already in …` when it was there).
 - **If Trakt fails, the file is still moved.** The message says
-  `⚠️ Trakt: not added to GDriveMovies — <reason>` and carries a
+  `⚠️ Trakt: not added to GDrive Movies — <reason>` and carries a
   **🔁 Retry Trakt** button. Tap it any time; it re-tries just the Trakt
   step and rewrites that one line.
 - After 3 failures in a row (or a login/account-limit error) the rest of
@@ -450,6 +450,22 @@ with an error from Trakt, that error text is what decides the next step
   you; `resetTraktBackfill` clears the saved place to start over.
 - With `DRY_RUN=true` it only counts and sends nothing to Trakt — a cheap
   way to see how many titles you'd be adding before deciding.
+
+**Renaming the lists.** The lists are called **GDrive Movies** and **GDrive
+Series** (earlier versions used `GDriveMovies` / `GDriveSeries`, no space).
+A list that already exists under the old name is found and reused, never
+duplicated. If you rename a list on trakt.tv, update `Code.gs` first (the
+names are the `TRAKT_LIST_NAME_` line), *then* rename — if Trakt changes the
+list's address when renaming, the script re-finds it by name, and it can only
+do that if the name in the code matches.
+
+**"Why is my count short?" — run `findMissingFromTrakt`.** Read-only: it
+compares your Done folders with what is actually on each Trakt list and
+reports, by name, (a) folders with no `[tmdbid-…]` (never sent), (b) two
+folders sharing one TMDb id — they count as **one** list entry, the most
+common reason a total is a little low, and (c) a title with an id that simply
+isn't on the list (re-run `backfillTraktLists`; if it stays missing, Trakt has
+no entry for that id). Telegram gets the result.
 
 **Limits worth knowing**
 - One-way: Drive → Trakt. Deleting or moving a file in Drive by hand does
