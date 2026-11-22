@@ -1606,7 +1606,7 @@ function traktListSlug_(kind) {
   var wanted = [name, TRAKT_LIST_LEGACY_NAME_[kind]];
   for (var w = 0; w < wanted.length && !slug; w++) {
     for (var i = 0; i < lists.length; i++) {
-      if (lists[i].name === wanted[w] && lists[i].ids && lists[i].ids.slug) { slug = lists[i].ids.slug; break; }
+      if (lists[i].name === wanted[w] && lists[i].ids && (lists[i].ids.trakt || lists[i].ids.slug)) { slug = String(lists[i].ids.trakt || lists[i].ids.slug); break; }
     }
   }
   if (!slug) {
@@ -1616,11 +1616,31 @@ function traktListSlug_(kind) {
       privacy: 'private', display_numbers: false, allow_comments: false, sort_by: 'added', sort_how: 'desc'
     });
     if (!c.ok) throw new Error(c.error);
-    slug = c.body && c.body.ids && c.body.ids.slug;
-    if (!slug) throw new Error('Trakt created the list but returned no slug');
+    slug = c.body && c.body.ids && (c.body.ids.trakt || c.body.ids.slug);
+    if (!slug) throw new Error('Trakt created the list but returned no id');
+    slug = String(slug);
   }
   PropertiesService.getScriptProperties().setProperty(propName, slug);
   return slug;
+}
+
+// Runs a request against the kind's list. If Trakt says the list is gone
+// (404) or private/unknown (403 — what Trakt answers for a slug that no longer
+// exists, e.g. after the list was renamed on trakt.tv), forget the cached
+// slug, re-find the list by NAME and retry once.
+function traktListRequest_(kind, method, suffix, payload) {
+  var r;
+  for (var attempt = 0; attempt < 2; attempt++) {
+    var slug;
+    try { slug = traktListSlug_(kind); } catch (e) { return { ok: false, error: e.message, code: 0 }; }
+    r = traktRequest_(method, '/users/me/lists/' + encodeURIComponent(slug) + suffix, payload);
+    if ((r.code === 404 || r.code === 403) && attempt === 0) {
+      PropertiesService.getScriptProperties().deleteProperty(TRAKT_LIST_SLUG_PROP_[kind]);
+      continue;
+    }
+    return r;
+  }
+  return r;
 }
 
 // Adds (or removes) TMDb ids on the kind's list. Never throws.
@@ -1629,24 +1649,14 @@ function traktListChange_(kind, tmdbIds, remove) {
   var key = kind === 'movie' ? 'movies' : 'shows';
   var payload = {};
   payload[key] = tmdbIds.map(function (id) { return { ids: { tmdb: Number(id) } }; });
-  for (var attempt = 0; attempt < 2; attempt++) {
-    var slug;
-    try { slug = traktListSlug_(kind); } catch (e) { return { ok: false, error: e.message, code: 0 }; }
-    var r = traktRequest_('POST', '/users/me/lists/' + encodeURIComponent(slug) + '/items' + (remove ? '/remove' : ''), payload);
-    if (r.code === 404 && attempt === 0) {
-      // The list was deleted on Trakt since we cached its slug — forget it and recreate once.
-      PropertiesService.getScriptProperties().deleteProperty(TRAKT_LIST_SLUG_PROP_[kind]);
-      continue;
-    }
-    if (!r.ok) return { ok: false, error: r.error, code: r.code };
-    var b = r.body || {};
-    var n = function (section) { return (b[section] && b[section][key]) || 0; };
-    return {
-      ok: true, added: n('added'), existing: n('existing'), deleted: n('deleted'),
-      notFound: (b.not_found && b.not_found[key]) ? b.not_found[key].length : 0
-    };
-  }
-  return { ok: false, error: 'Trakt list not found', code: 404 };
+  var r = traktListRequest_(kind, 'POST', '/items' + (remove ? '/remove' : ''), payload);
+  if (!r.ok) return { ok: false, error: r.error, code: r.code };
+  var b = r.body || {};
+  var n = function (section) { return (b[section] && b[section][key]) || 0; };
+  return {
+    ok: true, added: n('added'), existing: n('existing'), deleted: n('deleted'),
+    notFound: (b.not_found && b.not_found[key]) ? b.not_found[key].length : 0
+  };
 }
 
 // ----- add after a successful rename -----
@@ -1776,11 +1786,9 @@ function traktTestConnection() {
 // All TMDb ids currently on one of the two Trakt lists (paged). Read-only.
 function traktListTmdbIds_(kind) {
   var key = kind === 'movie' ? 'movies' : 'shows';
-  var slug;
-  try { slug = traktListSlug_(kind); } catch (e) { return { ok: false, error: e.message }; }
   var ids = {}, page = 1, pages = 1, limit = 500;
   do {
-    var r = traktRequest_('GET', '/users/me/lists/' + encodeURIComponent(slug) + '/items/' + key + '?page=' + page + '&limit=' + limit);
+    var r = traktListRequest_(kind, 'GET', '/items/' + key + '?page=' + page + '&limit=' + limit);
     if (!r.ok) return { ok: false, error: r.error };
     var body = r.body || [];
     body.forEach(function (it) {
