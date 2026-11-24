@@ -2450,7 +2450,8 @@ function coreName_(name) {
 // tag filter still sees them). Used by both the movie and the TV parsers.
 function normalizeUnderscores_(base) {
   if (base.indexOf('_') === -1) return base;
-  base = base.replace(/_([1257])_([01])(?=_|$|\s)/g, ' $1.$2')
+  base = base.replace(/(?<![A-Za-z])(DDP|DD\+?|EAC3|E-AC3|AC3|AAC|DTS|Opus|FLAC|Atmos|TrueHD)([1257])_([01])(?=_|$|\s)/gi, '$1 $2.$3')
+             .replace(/_([1257])_([01])(?=_|$|\s)/g, ' $1.$2')
              .replace(/_/g, ' ')
              .replace(/\bWEB DL\b/gi, 'WEB-DL')
              .replace(/\bBlu Ray\b/gi, 'Blu-Ray')
@@ -3908,7 +3909,7 @@ var STANDARD_TAG_PATTERNS_ = [
   // list also left out) + DDP (the alternate spelling of DD+/E-AC3 seen
   // constantly in the wild as "DDP5.1") + Dual/Multi Audio (very relevant
   // for this user's multi-language library specifically).
-  /\b2\.0\b/, /\b5\.1\b/, /\b7\.1\b/,
+  /(?<![\d.])2\.0(?![\dA-Za-z])/, /(?<![\d.])5\.1(?![\dA-Za-z])/, /(?<![\d.])7\.1(?![\dA-Za-z])/,
   /\bE-?AC3\b/i, /\bDDP(?![A-Za-z])/i, /\bDD\+?(?![A-Za-z])/i, /\bAC3\b/i, /\bAAC\b/i, /\bMP3\b/i,
   /\bFLAC\b/i, /\bLPCM\b/i, /\bPCM\b/i,
   /\bTrueHD\b/i, /\bDTS-?HD(\s*MA)?\b/i, /\bDTS\b/i, /\bAtmos\b/i,
