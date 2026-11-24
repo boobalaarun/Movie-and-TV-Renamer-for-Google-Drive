@@ -2442,6 +2442,22 @@ function coreName_(name) {
 // mistaken for a site prefix, since the match still requires the whole
 // token to be immediately followed by " - " (space-dash-space) - the same
 // guard that already prevents a false match on ordinary dotted text.
+// Fixed 2026-11-24: underscore-separated releases ("Vada_Chennai_2018_1080p_
+// 10bit_WEBRip_Tam_Opus_5_1_x265_HEVC_ATH", "Loki_2021_S01E01_720p_...")
+// never matched a year or any tag, because "_" counts as a word character and
+// so every \b word-boundary test failed. Turn them into spaces first
+// (re-joining audio layouts like 5_1 / 7_1 / 2_0 and WEB_DL / Blu_Ray so the
+// tag filter still sees them). Used by both the movie and the TV parsers.
+function normalizeUnderscores_(base) {
+  if (base.indexOf('_') === -1) return base;
+  base = base.replace(/_([1257])_([01])(?=_|$|\s)/g, ' $1.$2')
+             .replace(/_/g, ' ')
+             .replace(/\bWEB DL\b/gi, 'WEB-DL')
+             .replace(/\bBlu Ray\b/gi, 'Blu-Ray')
+             .replace(/\s{2,}/g, ' ').trim();
+  return stripSitePrefix_(base);
+}
+
 function stripSitePrefix_(base) {
   return base.replace(/^\s*(?:www\.)?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,24}\s+-\s+/, '');
 }
@@ -3079,6 +3095,7 @@ function parseEpisodeFilename_(fullName) {
   var ext = getExtension_(fullName);
   base = decodeHtmlEntities_(base);
   base = stripSitePrefix_(base);
+  base = normalizeUnderscores_(base);
 
   var epMatch = null;
   for (var p = 0; p < EPISODE_PATTERNS_.length; p++) {
@@ -3740,19 +3757,7 @@ function parseFilename_(fullName) {
   base = decodeHtmlEntities_(base);
   base = stripSitePrefix_(base);
 
-  // Fixed 2026-11-24: underscore-separated releases ("Vada_Chennai_2018_1080p_
-  // 10bit_WEBRip_Tam_Opus_5_1_x265_HEVC_ATH.mkv") never matched a year or any
-  // tag, because "_" counts as a word character and so every \b word-boundary
-  // test below failed. Turn them into spaces first (re-joining audio layouts
-  // like 5_1 / 7_1 / 2_0 and WEB_DL / Blu_Ray so the tag filter still sees them).
-  if (base.indexOf('_') !== -1) {
-    base = base.replace(/_([1257])_([01])(?=_|$|\s)/g, ' $1.$2')
-               .replace(/_/g, ' ')
-               .replace(/\bWEB DL\b/gi, 'WEB-DL')
-               .replace(/\bBlu Ray\b/gi, 'Blu-Ray')
-               .replace(/\s{2,}/g, ' ').trim();
-    base = stripSitePrefix_(base);
-  }
+  base = normalizeUnderscores_(base);
 
   var year = null;
   var beforeYearBase = base;
